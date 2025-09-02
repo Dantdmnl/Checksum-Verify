@@ -52,10 +52,8 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
 Open PowerShell and run:
 
 ```powershell
-iex "& { $(iwr -useb 'https://raw.githubusercontent.com/<your-repo>/checksum-tool/main/checksum-tool.ps1') }"
+iex "& { $(iwr -useb 'https://raw.githubusercontent.com/Dantdmnl/Checksum-Verify/blob/main/checksum-tool.ps1') }"
 ```
-
-(Replace the URL with the correct raw URL for your repository/release.)
 
 ## Usage
 
