@@ -13,61 +13,59 @@
 
 .NOTES
     - Author: Ruben Draaisma
-    - Version: 1.0
+    - Version: 1.0.1
     - Tested on: Windows 11 24H2
     - Tested with: PowerShell ISE, PowerShell 5.1 and PowerShell 7
 #>
 
-#region Settings persistence
+#region Settings persistence (robust, first-run safe)
 
 function Get-SettingsFilePath {
-    $dir = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'checksum-tool'
+    try {
+        # Safer: use Environment API (works even when $env:LOCALAPPDATA isn't set)
+        $localApp = [Environment]::GetFolderPath('LocalApplicationData')
+        if (-not $localApp -or [string]::IsNullOrWhiteSpace($localApp)) {
+            # Fallback to TEMP (guaranteed)
+            $localApp = $env:TEMP
+        }
+    } catch {
+        $localApp = $env:TEMP
+    }
+
+    $dir = Join-Path -Path $localApp -ChildPath 'checksum-tool'
+
+    # Ensure directory exists (best-effort)
     if (-not (Test-Path -LiteralPath $dir)) {
         try { New-Item -ItemType Directory -Path $dir -Force | Out-Null } catch {}
     }
+
     return Join-Path -Path $dir -ChildPath 'settings.json'
 }
 
 function Get-DefaultSettings {
-    return @{ 
-        AutoCopyToClipboard    = $false
-        ProgressUpdateIntervalMs = 200
-        ProgressMinDeltaPercent = 0.25
-    }
-}
-
-function Load-Settings {
-    $path = Get-SettingsFilePath
-    if (Test-Path -LiteralPath $path) {
-        try {
-            $json = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
-            $o = $json | ConvertFrom-Json -ErrorAction Stop
-            # make sure missing keys get defaults
-            $defaults = Get-DefaultSettings
-            foreach ($k in $defaults.Keys) {
-                if (-not ($o.PSObject.Properties.Name -contains $k)) {
-                    $o | Add-Member -MemberType NoteProperty -Name $k -Value $defaults[$k]
-                }
-            }
-            return $o
-        } catch {
-            Write-Verbose ("Failed to read settings, recreating defaults: {0}" -f $_.Exception.Message)
-            $defaults = Get-DefaultSettings
-            Save-Settings -Settings $defaults
-            return $defaults
-        }
-    } else {
-        $defaults = Get-DefaultSettings
-        Save-Settings -Settings $defaults
-        return $defaults
+    # Return a PSCustomObject so callers can reliably use dot-property access.
+    return [PSCustomObject]@{ 
+        AutoCopyToClipboard       = $false
+        ProgressUpdateIntervalMs  = 200
+        ProgressMinDeltaPercent   = 0.25
     }
 }
 
 function Save-Settings {
     param([Parameter(Mandatory=$true)] $Settings)
     $path = Get-SettingsFilePath
+
     try {
-        $Settings | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $path -Encoding UTF8 -Force
+        # Ensure folder exists before writing (defensive)
+        $dir = Split-Path -Parent $path
+        if (-not (Test-Path -LiteralPath $dir)) {
+            try { New-Item -ItemType Directory -Path $dir -Force | Out-Null } catch {}
+        }
+
+        # Convert and write atomically (best-effort)
+        $json = $Settings | ConvertTo-Json -Depth 3 -ErrorAction Stop
+        # Use Set-Content with UTF8 (works reliably across PS editions)
+        $json | Set-Content -LiteralPath $path -Encoding UTF8 -Force
         return $true
     } catch {
         Write-Verbose ("Failed to save settings to '{0}': {1}" -f $path, $_.Exception.Message)
@@ -75,8 +73,96 @@ function Save-Settings {
     }
 }
 
-# Load settings into global variable
-$Global:Settings = Load-Settings
+function Normalize-SettingsObject {
+    param([Parameter(Mandatory=$true)] $Obj)
+
+    # Ensure PSCustomObject
+    if (-not ($Obj -is [PSCustomObject])) {
+        try { $Obj = [PSCustomObject]$Obj } catch { $Obj = [PSCustomObject]@{} }
+    }
+
+    # Apply defaults for missing properties
+    $defaults = Get-DefaultSettings
+    foreach ($prop in $defaults.PSObject.Properties.Name) {
+        if (-not $Obj.PSObject.Properties.Name -contains $prop) {
+            $Obj | Add-Member -MemberType NoteProperty -Name $prop -Value ($defaults.$prop)
+        }
+    }
+
+    # Coerce types & validate values (best-effort)
+    try {
+        $tmp = 0
+        if (-not [int]::TryParse("$($Obj.ProgressUpdateIntervalMs)", [ref]$tmp) -or $tmp -le 0) {
+            $Obj.ProgressUpdateIntervalMs = $defaults.ProgressUpdateIntervalMs
+        } else {
+            $Obj.ProgressUpdateIntervalMs = [int]$tmp
+        }
+    } catch { $Obj.ProgressUpdateIntervalMs = $defaults.ProgressUpdateIntervalMs }
+
+    try {
+        $d = [double]::Parse("$($Obj.ProgressMinDeltaPercent)") 2>$null
+        if ($d -lt 0) { $Obj.ProgressMinDeltaPercent = $defaults.ProgressMinDeltaPercent } else { $Obj.ProgressMinDeltaPercent = [double]$d }
+    } catch { $Obj.ProgressMinDeltaPercent = $defaults.ProgressMinDeltaPercent }
+
+    # Ensure boolean for AutoCopyToClipboard
+    try {
+        $b = $Obj.AutoCopyToClipboard
+        if ($b -is [string]) {
+            $Obj.AutoCopyToClipboard = $b -match '^(1|true|yes)$'
+        } else {
+            $Obj.AutoCopyToClipboard = [bool]$b
+        }
+    } catch { $Obj.AutoCopyToClipboard = $defaults.AutoCopyToClipboard }
+
+    return $Obj
+}
+
+function Load-Settings {
+    $path = Get-SettingsFilePath
+
+    # If file doesn't exist -> create defaults and return them
+    if (-not (Test-Path -LiteralPath $path)) {
+        $defaults = Get-DefaultSettings
+        Save-Settings -Settings $defaults | Out-Null
+        return [PSCustomObject]$defaults
+    }
+
+    # File exists - try to read, handle empty or malformed JSON gracefully
+    try {
+        $json = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+
+        if (-not $json -or $json.Trim().Length -eq 0) {
+            # empty file: recreate defaults
+            Write-Verbose "Settings file empty; recreating defaults."
+            $defaults = Get-DefaultSettings
+            Save-Settings -Settings $defaults | Out-Null
+            return [PSCustomObject]$defaults
+        }
+
+        $o = $json | ConvertFrom-Json -ErrorAction Stop
+
+        # Normalize (add missing keys and fix types)
+        $o = Normalize-SettingsObject -Obj $o
+
+        return $o
+    } catch {
+        # Something went wrong reading or parsing -> fallback to defaults and overwrite file
+        Write-Verbose ("Failed to read/parse settings; recreating defaults: {0}" -f $_.Exception.Message)
+        $defaults = Get-DefaultSettings
+        Save-Settings -Settings $defaults | Out-Null
+        return [PSCustomObject]$defaults
+    }
+}
+
+# Load settings into global variable and ensure PSCustomObject
+try {
+    $loaded = Load-Settings
+    if (-not $loaded) { $loaded = Get-DefaultSettings }
+    $Global:Settings = Normalize-SettingsObject -Obj $loaded
+} catch {
+    Write-Verbose ("Unexpected error while loading settings; using defaults: {0}" -f $_.Exception.Message)
+    $Global:Settings = Get-DefaultSettings
+}
 
 #endregion
 
