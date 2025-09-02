@@ -42,18 +42,10 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
 
 ## Installation
 
-### Method 1 — Download and run locally
+### Download and run locally
 
-1. Download the latest `checksum-tool.ps1` (or `checksum-test.ps1`) from the repository's releases.
+1. Download the latest `Checksum-Verify.ps1` from the repository's releases.
 2. Right-click the file and choose **Run with PowerShell**, or run it from an elevated PowerShell window if needed.
-
-### Method 2 — Run directly from GitHub (one-liner)
-
-Open PowerShell and run:
-
-```powershell
-iex "& { $(iwr -useb 'https://raw.githubusercontent.com/Dantdmnl/Checksum-Verify/blob/main/checksum-tool.ps1') }"
-```
 
 ## Usage
 
