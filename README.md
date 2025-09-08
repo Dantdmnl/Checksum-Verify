@@ -4,7 +4,7 @@ Menu-driven PowerShell checksum tool (MD5/SHA1/SHA256/...) with clipboard & ISE 
 ## NOTES
 
 - **Author:** Ruben Draaisma
-- **Version:** 1.0
+- **Version:** 1.1.0
 - **Tested on:** Windows 11 24H2
 - **Tested with:** PowerShell ISE, PowerShell 5.1 and PowerShell 7
 
@@ -27,6 +27,8 @@ The tool is designed to be used interactively (menu-driven) but also exposes fun
 - File quick-save and save-with-metadata options.
 - Algorithm selection menu and automatic algorithm detection when verifying checksums.
 - GUI file selection dialogs (Windows Forms) for interactive file selection.
+- Typed path dialog for CLI based file selection.
+- Logging.
 
 ## Prerequisites
 
@@ -80,20 +82,23 @@ Settings are stored (JSON) in:
 %LOCALAPPDATA%\checksum-tool\settings.json
 ```
 
-Default keys: `AutoCopyToClipboard`, `ProgressUpdateIntervalMs`, `ProgressMinDeltaPercent`.
+Default keys: `AutoCopyToClipboard`, `ProgressUpdateIntervalMs`, `ProgressMinDeltaPercent`, `UseFileDialog`, `LogDirectory`.
 
 Example JSON:
 
 ```json
 {
-  "AutoCopyToClipboard": false,
-  "ProgressUpdateIntervalMs": 200,
-  "ProgressMinDeltaPercent": 0.25
+    "AutoCopyToClipboard":  true,
+    "ProgressUpdateIntervalMs":  200,
+    "ProgressMinDeltaPercent":  25,
+    "UseFileDialog":  true,
+    "LogDirectory":  "C:\\Users\\YourUser\\AppData\\Local\\checksum-tool"
 }
 ```
 
 ## Troubleshooting
 
+- **Check Logs**
 - **PowerShell ISE**: The script includes a cross-host single-key reader (`Read-SingleKey`) so single-key input works in ISE as well as in regular consoles. If your environment still requires pressing Enter in some hosts, the script will fall back to `Read-Host` as a last-resort.
 - **Clipboard failures**: If `Set-Clipboard` is unavailable or fails, the script attempts a Windows Forms clipboard fallback. That fallback requires an interactive desktop session.
 - **Permissions / Execution Policy**: If the script fails to run, ensure your execution policy allows running unsigned scripts for the current user (see prerequisites).
