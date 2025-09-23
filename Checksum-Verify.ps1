@@ -16,13 +16,13 @@
 
 .NOTES
     - Author: Ruben Draaisma
-    - Version: 1.2.0
+    - Version: 1.2.1
     - Tested on: Windows 11 24H2
     - Tested with: PowerShell ISE, PowerShell 5.1 and PowerShell 7
 #>
 
 #region Version & helper: settings path
-$ScriptVersion = '1.2.0'
+$ScriptVersion = '1.2.1'
 
 function Get-SettingsFilePath {
     try {
@@ -398,98 +398,123 @@ function Extract-ChecksumFromFile {
 
     try {
         $lines = Get-Content -LiteralPath $Path -ErrorAction Stop
-        $rawText = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
     } catch {
         Throw "Unable to read checksum file: $($_.Exception.Message)"
     }
 
     $candidates = @()
-    $lineIndex = 0
+    $lineNum = 0
+    $target = if ($TargetFilename) { [regex]::Escape($TargetFilename) } else { $null }
 
-    foreach ($rawLine in $lines) {
-        $lineIndex++
-        if (-not $rawLine) { continue }
-        $line = $rawLine.Trim()
+    foreach ($raw in $lines) {
+        $lineNum++
+        if (-not $raw) { continue }
+        $line = $raw.Trim()
 
-        # Prefer labeled Algorithm: lines (store hint)
-        if ($line -match '(?i)^\s*Algorithm\s*[:=]\s*(\S+)') {
-            $algoLabel = $matches[1].ToUpper()
-            switch ($algoLabel) {
-                'SHA-1' { $algoLabel = 'SHA1' }
-                'SHA1'  { $algoLabel = 'SHA1' }
-                'SHA256'{ $algoLabel = 'SHA256' }
-                'SHA384'{ $algoLabel = 'SHA384' }
-                'SHA512'{ $algoLabel = 'SHA512' }
-                'MD5'   { $algoLabel = 'MD5' }
+        # Skip comment lines commonly found in distros (lines starting with #, ; or //)
+        if ($line -match '^\s*(#|;|//)') { continue }
+
+        # 1) Patterns like: "SHA256 (filename) = <hex>" or "SHA256 filename = <hex>" or "SHA-1 (...) = <hex>"
+        if ($line -match '(?i)^\s*(?<alg>MD5|SHA-1|SHA1|SHA256|SHA384|SHA512)\b[^\r\n]*?(?:=|:)\s*(?<hex>[0-9A-Fa-f]{32,128})\b') {
+            $hex = $matches['hex'].ToLower()
+            $alg = $matches['alg'].ToUpper() -replace 'SHA-1','SHA1'
+            switch ($alg) {
+                'SHA1'  { $alg = 'SHA1' }
+                'SHA256'{ $alg = 'SHA256' }
+                'SHA384'{ $alg = 'SHA384' }
+                'SHA512'{ $alg = 'SHA512' }
+                'MD5'   { $alg = 'MD5' }
             }
-            $candidates += [PSCustomObject]@{ Checksum = $null; Algorithm = $algoLabel; Line = $line; LineNumber = $lineIndex; Preferred = $false }
+            $fileMention = $false
+            if ($target -and ($line -match $target)) { $fileMention = $true }
+            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $true }
             continue
         }
 
-        # Prefer labeled Checksum: <value>
-        if ($line -match '(?i)^\s*Checksum\s*[:=]\s*(.+)$') {
-            $raw = $matches[1].Trim()
-            $norm = Normalize-ChecksumString -Raw $raw
-            if ($norm) {
-                $algo = Get-ChecksumAlgorithmFromLength -Checksum $norm
-                $candidates += [PSCustomObject]@{ Checksum = $norm; Algorithm = $algo; Line = $line; LineNumber = $lineIndex; Preferred = $true }
-                continue
-            }
+        # 2) Common unix "sha256sum" style: "<hex>  filename" or "<hex> *filename"
+        if ($line -match '(?i)^\s*(?<hex>[0-9A-Fa-f]{32,128})\s+\*?(?<fname>.+?)\s*$') {
+            $hex = $matches['hex'].ToLower()
+            $fname = $matches['fname'].Trim("`"", "'")
+            $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
+            $fileMention = $false
+            if ($target -and ($fname -match $target -or $line -match $target)) { $fileMention = $true }
+            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $fileMention }
+            continue
         }
 
-        # Generic hex tokens on a line (handles sha256sum / certutil / other common formats)
-        $hexMatches = [regex]::Matches($line, '([0-9A-Fa-f]{32}|[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64}|[0-9A-Fa-f]{96}|[0-9A-Fa-f]{128})') | ForEach-Object { $_.Value }
+        # 3) Labeled single-value lines: "Checksum: <hex>" or "checksum = <hex>"
+        if ($line -match '(?i)^\s*Checksum\s*[:=]\s*(?<hex>[0-9A-Fa-f]{32,128})\b') {
+            $hex = $matches['hex'].ToLower()
+            $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
+            $fileMention = ($target -and ($line -match $target))
+            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $true }
+            continue
+        }
+
+        # 4) Algorithm hint only: "Algorithm: SHA256"
+        if ($line -match '(?i)^\s*Algorithm\s*[:=]\s*(?<alg>MD5|SHA-1|SHA1|SHA256|SHA384|SHA512)\b') {
+            $alg = $matches['alg'].ToUpper() -replace 'SHA-1','SHA1'
+            switch ($alg) {
+                'SHA1'  { $alg = 'SHA1' }
+                'SHA256'{ $alg = 'SHA256' }
+                'SHA384'{ $alg = 'SHA384' }
+                'SHA512'{ $alg = 'SHA512' }
+                'MD5'   { $alg = 'MD5' }
+            }
+            $candidates += [PSCustomObject]@{ Checksum = $null; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $false; Preferred = $false }
+            continue
+        }
+
+        # 5) Generic: find any hex runs (32..128) on the line and treat them as potential checksums
+        $hexMatches = [regex]::Matches($line, '[0-9A-Fa-f]{32,128}') | ForEach-Object { $_.Value }
         if ($hexMatches -and $hexMatches.Count -gt 0) {
             foreach ($hm in $hexMatches) {
-                $norm = $hm.ToLower()
-                $algo = Get-ChecksumAlgorithmFromLength -Checksum $norm
-                $pref = $false
-                if ($TargetFilename -and ($line -match [regex]::Escape($TargetFilename))) { $pref = $true }
-                if ($line -match '(?i)^\s*(md5|sha1|sha256|sha384|sha512)') { $pref = $true }
-                if ($line -match '(?i)checksum') { $pref = $true }
-                $candidates += [PSCustomObject]@{ Checksum = $norm; Algorithm = $algo; Line = $line; LineNumber = $lineIndex; Preferred = $pref }
+                $hex = $hm.ToLower()
+                $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
+                $fileMention = $false
+                if ($target -and ($line -match $target)) { $fileMention = $true }
+                # prefer lines that also contain the word 'checksum' or an algorithm name
+                $preferred = ($line -match '(?i)checksum') -or ($line -match '(?i)\b(md5|sha1|sha256|sha384|sha512)\b')
+                $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $preferred }
             }
-        }
-    }
-
-    # If nothing found in lines, scan whole file for any hex runs
-    if ($candidates.Count -eq 0) {
-        $allHex = [regex]::Matches($rawText, '[0-9A-Fa-f]{32,128}') | ForEach-Object { $_.Value } | Select-Object -Unique
-        foreach ($h in $allHex) {
-            $norm = $h.ToLower()
-            $algo = Get-ChecksumAlgorithmFromLength -Checksum $norm
-            $candidates += [PSCustomObject]@{ Checksum = $norm; Algorithm = $algo; Line = $null; LineNumber = 0; Preferred = $false }
         }
     }
 
     if ($candidates.Count -eq 0) { return $null }
 
-    # Scoring: favor labeled checksum, then 'checksum' keyword, then filename match, then length, then earliest
+    # Scoring: highest weight to FilenameMatch + Preferred label, then explicit Preferred, then algorithm known, then length, then earliest line number.
     $scored = $candidates | ForEach-Object {
         $score = 0
-        if ($_.Preferred) { $score += 200 }                     # labeled Checksum: highest
-        if ($_.Line -and ($_.Line -match '(?i)checksum')) { $score += 100 }
-        if ($TargetFilename -and $_.Line -and ($_.Line -match [regex]::Escape($TargetFilename))) { $score += 50 }
-        if ($_.Algorithm) { $score += 10 }
-        if ($_.Checksum) { $score += $_.Checksum.Length }
+        if ($_.FilenameMatch) { $score += 1000 }
+        if ($_.Preferred) { $score += 500 }
+        if ($_.Algorithm) { $score += 50 }
+        if ($_.Checksum) { $score += $_.Checksum.Length } else { $score += 0 }
+        # penalize null checksum candidates (algorithm-only hints)
+        if (-not $_.Checksum) { $score -= 100 }
         [PSCustomObject]@{ Candidate = $_; Score = $score }
     }
 
     $best = $scored | Sort-Object -Property @{Expression='Score';Descending=$true},@{Expression={'$_.Candidate.LineNumber'};Descending=$false} | Select-Object -First 1
+
     if ($best -and $best.Candidate.Checksum) {
+        # ensure Algorithm is set if possible
         if (-not $best.Candidate.Algorithm) { $best.Candidate.Algorithm = Get-ChecksumAlgorithmFromLength -Checksum $best.Candidate.Checksum }
         return $best.Candidate
     }
 
-    # Fallback: longest hex candidate
-    $fallback = ($candidates | Where-Object { $_.Checksum } | Sort-Object { $_.Checksum.Length } -Descending | Select-Object -First 1)
-    if ($fallback) {
-        if (-not $fallback.Algorithm) { $fallback.Algorithm = Get-ChecksumAlgorithmFromLength -Checksum $fallback.Checksum }
-        return $fallback
+    # If best candidate had no checksum but provided algorithm hints and there exists any checksum candidate matching that algorithm, pick that.
+    if ($best -and -not $best.Candidate.Checksum -and $best.Candidate.Algorithm) {
+        $matchByAlg = $candidates | Where-Object { $_.Checksum -and (Get-ChecksumAlgorithmFromLength -Checksum $_.Checksum) -eq $best.Candidate.Algorithm } | Select-Object -First 1
+        if ($matchByAlg) { return $matchByAlg }
     }
+
+    # Fallback: return the longest checksum candidate
+    $fallback = ($candidates | Where-Object { $_.Checksum } | Sort-Object @{Expression = { $_.Checksum.Length }; Descending = $true }, @{Expression = { $_.LineNumber }; Descending = $false} | Select-Object -First 1)
+    if ($fallback) { if (-not $fallback.Algorithm) { $fallback.Algorithm = Get-ChecksumAlgorithmFromLength -Checksum $fallback.Checksum }; return $fallback }
 
     return $null
 }
+
 
 function Test-FileChecksum {
     [CmdletBinding()]
@@ -508,7 +533,7 @@ function Test-FileChecksum {
     $expectedChecksum = $null
     $derivedAlgorithm = $null
 
-    # If the provided ExpectedChecksumOrFile is a file path, parse it; otherwise treat as pasted string.
+    # If the provided ExpectedChecksumOrFile is a path to a file, attempt to parse it; otherwise treat as literal/pasted
     if (Test-Path -LiteralPath $ExpectedChecksumOrFile -PathType Leaf) {
         Log-Message -Message ("Parsing checksum from file: {0}" -f $ExpectedChecksumOrFile) -Level INFO
         try {
@@ -518,26 +543,28 @@ function Test-FileChecksum {
             Throw "Could not parse checksum file: $ExpectedChecksumOrFile"
         }
 
-        if (-not $parsed -or -not $parsed.Checksum) {
-            Throw "Could not extract a valid checksum from checksum file: $ExpectedChecksumOrFile"
+        if (-not $parsed) { Throw "Could not extract a checksum candidate from checksum file: $ExpectedChecksumOrFile" }
+        if (-not $parsed.Checksum) {
+            # If parser only returned algorithm hint, keep algorithm hint and let algorithm detection handle it
+            $derivedAlgorithm = $parsed.Algorithm
+        } else {
+            $expectedChecksum = Normalize-ChecksumString -Raw $parsed.Checksum
+            if (-not $expectedChecksum) { Throw "Extracted checksum is not valid hex." }
+            $derivedAlgorithm = $parsed.Algorithm
         }
-
-        $expectedChecksum = Normalize-ChecksumString -Raw $parsed.Checksum
-        if (-not $expectedChecksum) { Throw "Extracted checksum is not valid hex." }
-
-        $derivedAlgorithm = $parsed.Algorithm
     } else {
+        # Pasted value or user-typed value: normalize and treat as checksum
         $norm = Normalize-ChecksumString -Raw $ExpectedChecksumOrFile
         if (-not $norm) { Throw "Provided checksum string does not contain a valid hex checksum." }
         $expectedChecksum = $norm
     }
 
-    # Algorithm selection precedence:
-    # 1) explicit -Algorithm
-    # 2) length-based detection from expected checksum (works for pasted or parsed)
-    # 3) algorithm hint from checksum file (derivedAlgorithm)
-    # 4) if AutoDetectAlgorithm requested but detection fails -> error
-    # 5) otherwise request algorithm from user (error here)
+    # Determine algorithm to use (precedence):
+    #   1) explicit -Algorithm parameter
+    #   2) length-based detection from expected checksum (works for pasted and parsed checksums)
+    #   3) algorithm hint parsed from checksum file (derivedAlgorithm)
+    #   4) if AutoDetectAlgorithm requested but detection fails -> error
+    #   5) otherwise require -Algorithm
     $chosenAlgorithm = $null
 
     if ($Algorithm) {
@@ -548,18 +575,29 @@ function Test-FileChecksum {
             if ($lenAlg) { $chosenAlgorithm = $lenAlg }
         }
 
-        if (-not $chosenAlgorithm -and $derivedAlgorithm) { $chosenAlgorithm = $derivedAlgorithm }
+        if (-not $chosenAlgorithm -and $derivedAlgorithm) {
+            # normalize derivedAlgorithm label if present
+            $da = $derivedAlgorithm.ToUpper() -replace 'SHA-1','SHA1'
+            switch ($da) {
+                'SHA1'  { $da = 'SHA1' }
+                'SHA256'{ $da = 'SHA256' }
+                'SHA384'{ $da = 'SHA384' }
+                'SHA512'{ $da = 'SHA512' }
+                'MD5'   { $da = 'MD5' }
+            }
+            if ($da) { $chosenAlgorithm = $da }
+        }
 
         if (-not $chosenAlgorithm) {
             if ($AutoDetectAlgorithm) {
-                Throw "Unable to detect algorithm from provided checksum length. Please specify -Algorithm."
+                Throw "Unable to detect algorithm from checksum length or file hints. Please specify -Algorithm."
             } else {
-                Throw "Algorithm must be specified (use -Algorithm) or supply an ExpectedChecksum that clearly indicates algorithm length."
+                Throw "Algorithm must be specified (use -Algorithm) or supply an ExpectedChecksum that indicates algorithm length."
             }
         }
     }
 
-    # Compute checksum of file
+    # Compute checksum of target file
     try {
         $calc = Get-FileChecksumEx -Path $Path -Algorithm $chosenAlgorithm -ShowProgress:$ShowProgress -ErrorAction Stop
     } catch {
@@ -567,8 +605,8 @@ function Test-FileChecksum {
         Throw "Failed to compute checksum: $($_.Exception.Message)"
     }
 
-    # Normalize for comparison
-    $expectedChecksum = Normalize-ChecksumString -Raw $expectedChecksum
+    # Normalize both for reliable comparison
+    if ($expectedChecksum) { $expectedChecksum = Normalize-ChecksumString -Raw $expectedChecksum }
     $calculatedChecksum = Normalize-ChecksumString -Raw $calc.Checksum
 
     $match = $false
