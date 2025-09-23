@@ -4,7 +4,7 @@ Menu-driven PowerShell checksum tool (MD5/SHA1/SHA256/...) with clipboard & ISE 
 ## NOTES
 
 - **Author:** Ruben Draaisma
-- **Version:** 1.1.0
+- **Version:** 1.2.0
 - **Tested on:** Windows 11 24H2
 - **Tested with:** PowerShell ISE, PowerShell 5.1 and PowerShell 7
 
@@ -28,6 +28,7 @@ The tool is designed to be used interactively (menu-driven) but also exposes fun
 - Algorithm selection menu and automatic algorithm detection when verifying checksums.
 - GUI file selection dialogs (Windows Forms) for interactive file selection.
 - Typed path dialog for CLI based file selection.
+- Support for checksum files in various common formats
 - Logging.
 
 ## Prerequisites
@@ -56,8 +57,8 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
 1. Run the script.
 2. Use the single-key menu to select an action:
    - `1` Calculate checksum
-   - `2` Verify checksum (auto-detect algorithm)
-   - `3` Verify checksum (specify algorithm)
+   - `2` Verify checksum (auto-detect algorithm, supports pasted value or checksum-file)
+   - `3` Verify checksum (specify algorithm, supports pasted value or checksum-file)
    - `4` Preferences
    - `5` Exit
 3. Follow prompts and dialogs for file selection and actions.
