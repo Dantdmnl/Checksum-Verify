@@ -7,22 +7,39 @@
     - Stable throttled Write-Progress and Int64-safe math for large files
     - Quick-save and metadata-save functions (fast file writes)
     - Clipboard copy (Set-Clipboard preferred, fallback to Windows.Forms clipboard)
-    - Algorithm selection menu
+    - Algorithm selection menu with ESC key support
     - Settings persisted to %LOCALAPPDATA%\checksum-tool\settings.json
     - Main menu accepts single-key input (no Enter required)
-    - Support for both a file dialog and typed path
+    - Dual file selection modes: GUI (File Explorer) or CLI (Type/Paste/Drag-Drop)
+    - Recent files history for quick access
+    - Human-readable file size display with large file warnings
+    - Enhanced progress display with speed and ETA
+    - Window title shows progress during processing
+    - View recent log entries from preferences
     - Log file for troubleshooting
     - Support for checksum files in various common formats
+    - All functions use approved PowerShell verbs
+    - GDPR compliant with privacy controls
+
+.PRIVACY
+    This tool stores local data for functionality:
+    - Settings file: %LOCALAPPDATA%\checksum-tool\settings.json
+    - Log file: %LOCALAPPDATA%\checksum-tool\checksum_tool.log
+    - Recent files: File paths only (no file contents)
+    - Username: Optional, only in file metadata if enabled
+    
+    All data is stored locally on your device. No data is transmitted externally.
+    You can view, export, or delete all stored data via the Privacy menu.
 
 .NOTES
     - Author: Ruben Draaisma
-    - Version: 1.2.1
+    - Version: 1.3.0
     - Tested on: Windows 11 24H2
     - Tested with: PowerShell ISE, PowerShell 5.1 and PowerShell 7
 #>
 
 #region Version & helper: settings path
-$ScriptVersion = '1.2.1'
+$ScriptVersion = '1.3.0'
 
 function Get-SettingsFilePath {
     try {
@@ -44,6 +61,10 @@ function Get-DefaultSettings {
         ProgressMinDeltaPercent   = 0.25
         UseFileDialog             = $true
         LogDirectory              = $defaultLogDir
+        RecentFiles               = @()
+        MaxRecentFiles            = 10
+        IncludeUsernameInMetadata = $false
+        AnonymizeLogPaths         = $true
     }
 }
 #endregion
@@ -54,7 +75,7 @@ $Global:MaxLogArchives = 5
 $Global:MinLogLevel    = "INFO"
 $Global:LogLevels      = @{ "DEBUG"=1; "INFO"=2; "WARN"=3; "ERROR"=4; "CRITICAL"=5 }
 
-function Rotate-Logs {
+function Invoke-LogRotation {
     try {
         if (-not (Test-Path -Path $Global:LogFile)) { return }
         $fileSizeMB = (Get-Item $Global:LogFile).Length / 1MB
@@ -73,7 +94,7 @@ function Rotate-Logs {
     } catch { }
 }
 
-function Log-Message {
+function Write-LogMessage {
     param([string] $Message, [ValidateSet("DEBUG","INFO","WARN","ERROR","CRITICAL")] [string] $Level = "INFO")
     try {
         if ($Global:LogLevels[$Level] -lt $Global:LogLevels[$Global:MinLogLevel]) { return }
@@ -81,7 +102,14 @@ function Log-Message {
 
     try {
         if (-not $Global:LogFile) { return }
-        Rotate-Logs
+        Invoke-LogRotation
+        
+        # Anonymize file paths if enabled (GDPR privacy)
+        if ($Global:Settings.AnonymizeLogPaths) {
+            $Message = $Message -replace '([C-Z]:\\[^"'']+)', '[PATH_REDACTED]'
+            $Message = $Message -replace '(\\\\[^"'']+)', '[UNC_PATH_REDACTED]'
+        }
+        
         $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
         $entry = "{""timestamp"":""$ts"",""level"":""$Level"",""message"":""$Message""}"
         $entry | Out-File -FilePath $Global:LogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
@@ -98,15 +126,15 @@ function Save-Settings {
         if (-not (Test-Path -LiteralPath $dir)) { try { New-Item -ItemType Directory -Path $dir -Force | Out-Null } catch {} }
         $json = $Settings | ConvertTo-Json -Depth 4 -ErrorAction Stop
         $json | Set-Content -LiteralPath $path -Encoding UTF8 -Force
-        Log-Message -Message ("Settings saved to {0}" -f $path) -Level INFO
+        Write-LogMessage -Message ("Settings saved to {0}" -f $path) -Level INFO
         return $true
     } catch {
-        Log-Message -Message ("Failed saving settings: {0}" -f $_.Exception.Message) -Level ERROR
+        Write-LogMessage -Message ("Failed saving settings: {0}" -f $_.Exception.Message) -Level ERROR
         return $false
     }
 }
 
-function Normalize-SettingsObject {
+function ConvertTo-NormalizedSettings {
     param([Parameter(Mandatory=$true)] $Obj)
     if (-not ($Obj -is [PSCustomObject])) {
         try { $Obj = [PSCustomObject]$Obj } catch { $Obj = [PSCustomObject]@{} }
@@ -151,7 +179,7 @@ function Normalize-SettingsObject {
     return $Obj
 }
 
-function Load-Settings {
+function Import-Settings {
     $path = Get-SettingsFilePath
     if (-not (Test-Path -LiteralPath $path)) {
         $defaults = Get-DefaultSettings
@@ -166,10 +194,10 @@ function Load-Settings {
             return [PSCustomObject]$defaults
         }
         $o = $json | ConvertFrom-Json -ErrorAction Stop
-        $o = Normalize-SettingsObject -Obj $o
+        $o = ConvertTo-NormalizedSettings -Obj $o
         return $o
     } catch {
-        Log-Message -Message ("Settings load failed, recreating defaults: {0}" -f $_.Exception.Message) -Level WARN
+        Write-LogMessage -Message ("Settings load failed, recreating defaults: {0}" -f $_.Exception.Message) -Level WARN
         $defaults = Get-DefaultSettings
         Save-Settings -Settings $defaults | Out-Null
         return [PSCustomObject]$defaults
@@ -177,11 +205,11 @@ function Load-Settings {
 }
 
 try {
-    $loaded = Load-Settings
+    $loaded = Import-Settings
     if (-not $loaded) { $loaded = Get-DefaultSettings }
-    $Global:Settings = Normalize-SettingsObject -Obj $loaded
+    $Global:Settings = ConvertTo-NormalizedSettings -Obj $loaded
 } catch {
-    Log-Message -Message ("Unexpected error loading settings: {0}" -f $_.Exception.Message) -Level ERROR
+    Write-LogMessage -Message ("Unexpected error loading settings: {0}" -f $_.Exception.Message) -Level ERROR
     $Global:Settings = Get-DefaultSettings
 }
 
@@ -192,31 +220,143 @@ if (-not (Test-Path -Path $Global:LogDirectory)) {
 }
 $Global:LogFile = Join-Path -Path $Global:LogDirectory -ChildPath "checksum_tool.log"
 
-Log-Message -Message ("Checksum tool starting (v{0})" -f $ScriptVersion) -Level INFO
-Log-Message -Message ("LogDirectory set to {0}" -f $Global:LogDirectory) -Level INFO
+Write-LogMessage -Message ("Checksum tool starting (v{0})" -f $ScriptVersion) -Level INFO
+Write-LogMessage -Message ("LogDirectory set to {0}" -f $Global:LogDirectory) -Level INFO
+#endregion
+
+#region Utility: File size formatting
+function Format-FileSize {
+    param(
+        [Parameter(Mandatory=$true)]
+        [int64] $Bytes
+    )
+    
+    if ($Bytes -ge 1TB) {
+        return "{0:N2} TB" -f ($Bytes / 1TB)
+    } elseif ($Bytes -ge 1GB) {
+        return "{0:N2} GB" -f ($Bytes / 1GB)
+    } elseif ($Bytes -ge 1MB) {
+        return "{0:N2} MB" -f ($Bytes / 1MB)
+    } elseif ($Bytes -ge 1KB) {
+        return "{0:N2} KB" -f ($Bytes / 1KB)
+    } else {
+        return "{0} bytes" -f $Bytes
+    }
+}
 #endregion
 
 #region Utility: Clipboard (deferred Add-Type)
 function Copy-ToClipboard {
     param([Parameter(Mandatory=$true)][string] $Text)
     if (Get-Command -Name Set-Clipboard -ErrorAction SilentlyContinue) {
-        try { Set-Clipboard -Value $Text; return $true } catch { Log-Message -Message ("Set-Clipboard failed: {0}" -f $_.Exception.Message) -Level WARN }
+        try { Set-Clipboard -Value $Text; return $true } catch { Write-LogMessage -Message ("Set-Clipboard failed: {0}" -f $_.Exception.Message) -Level WARN }
     }
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
         [void][System.Windows.Forms.Clipboard]::SetText($Text)
         return $true
     } catch {
-        Log-Message -Message ("Fallback clipboard failed: {0}" -f $_.Exception.Message) -Level WARN
+        Write-LogMessage -Message ("Fallback clipboard failed: {0}" -f $_.Exception.Message) -Level WARN
         return $false
     }
 }
 #endregion
 
+#region Recent files management
+function Add-RecentFile {
+    param([Parameter(Mandatory=$true)][string] $FilePath)
+    
+    if (-not $Global:Settings.RecentFiles) {
+        $Global:Settings | Add-Member -MemberType NoteProperty -Name RecentFiles -Value @() -Force
+    }
+    
+    # Remove if already exists (to move to top)
+    $Global:Settings.RecentFiles = @($Global:Settings.RecentFiles | Where-Object { $_ -ne $FilePath })
+    
+    # Add to beginning
+    $Global:Settings.RecentFiles = @($FilePath) + $Global:Settings.RecentFiles
+    
+    # Trim to max
+    $maxFiles = if ($Global:Settings.MaxRecentFiles) { $Global:Settings.MaxRecentFiles } else { 10 }
+    if ($Global:Settings.RecentFiles.Count -gt $maxFiles) {
+        $Global:Settings.RecentFiles = $Global:Settings.RecentFiles[0..($maxFiles - 1)]
+    }
+    
+    Save-Settings -Settings $Global:Settings | Out-Null
+}
+
+function Show-RecentFilesMenu {
+    if (-not $Global:Settings.RecentFiles -or $Global:Settings.RecentFiles.Count -eq 0) {
+        Write-Host "No recent files." -ForegroundColor Yellow
+        Start-Sleep -Milliseconds 1000
+        return $null
+    }
+    
+    Clear-Host
+    Write-Host "Recent Files" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $validFiles = @()
+    $index = 1
+    foreach ($file in $Global:Settings.RecentFiles) {
+        if (Test-Path -LiteralPath $file -PathType Leaf) {
+            $fileName = Split-Path -Leaf $file
+            $fileSize = Format-FileSize -Bytes (Get-Item -LiteralPath $file).Length
+            Write-Host ("{0}) {1} ({2})" -f $index, $fileName, $fileSize)
+            Write-Host ("   {0}" -f $file) -ForegroundColor DarkGray
+            $validFiles += $file
+            $index++
+        }
+    }
+    
+    if ($validFiles.Count -eq 0) {
+        Write-Host "No valid recent files found." -ForegroundColor Yellow
+        Start-Sleep -Milliseconds 1000
+        return $null
+    }
+    
+    Write-Host ""
+    Write-Host "0) Cancel / Back"
+    Write-Host ""
+    
+    if ($validFiles.Count -le 9) {
+        Write-Host "Press ESC to cancel" -ForegroundColor DarkGray
+        Write-Host "Choose a file (0-$($validFiles.Count)):"
+        
+        $choice = Read-SingleKey
+        try { $choice = [string]$choice; $choice = $choice.Trim() } catch {}
+    } else {
+        Write-Host "Press ESC to cancel or press Enter after typing your choice" -ForegroundColor DarkGray
+        $choice = Read-Host "Choose a file (0-$($validFiles.Count))"
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq '0' -or $choice -eq [char]27 -or $choice -match '^\x1B') {
+        return $null
+    }
+    
+    try {
+        $idx = [int]$choice - 1
+        if ($idx -ge 0 -and $idx -lt $validFiles.Count) {
+            return $validFiles[$idx]
+        }
+    } catch {}
+    
+    Write-Host "Invalid choice." -ForegroundColor Yellow
+    Start-Sleep -Milliseconds 700
+    return $null
+}
+#endregion
+
 #region File selection helper (typed-path trims quotes)
 function Select-File {
-    param([string] $Prompt = "Select a file", [string] $InitialDirectory = $null)
+    param(
+        [string] $Prompt = "Select a file",
+        [string] $InitialDirectory = $null,
+        [switch] $ShowFileInfo
+    )
     if (-not $InitialDirectory) { $InitialDirectory = [Environment]::GetFolderPath('Desktop') }
+
+    $selectedFile = $null
 
     if ($Global:Settings.UseFileDialog) {
         try {
@@ -225,24 +365,78 @@ function Select-File {
             $fileDialog.InitialDirectory = $InitialDirectory
             $fileDialog.Filter = "All files (*.*)|*.*"
             $fileDialog.Title = $Prompt
-            if ($fileDialog.ShowDialog() -eq 'OK') { return $fileDialog.FileName } else { return $null }
+            if ($fileDialog.ShowDialog() -eq 'OK') {
+                $selectedFile = $fileDialog.FileName
+            } else {
+                return $null
+            }
         } catch {
-            Log-Message -Message ("OpenFileDialog failed: {0}" -f $_.Exception.Message) -Level WARN
+            Write-LogMessage -Message ("OpenFileDialog failed: {0}" -f $_.Exception.Message) -Level WARN
             return $null
         }
     } else {
+        # CLI mode - type or paste path
+        Write-Host ""
+        Write-Host "File Selection (CLI Mode)" -ForegroundColor Cyan
+        Write-Host "Tip: You can drag & drop a file into this window, or copy/paste the path" -ForegroundColor DarkGray
+        Write-Host ""
+        
         while ($true) {
-            $input = Read-Host ("{0} - enter full path (leave blank to cancel)" -f $Prompt)
-            if (-not $input) { return $null }
-            $input = $input.Trim()
-            $input = $input.Trim('"','''')
+            $userInput = Read-Host ("{0} - Enter full path (or leave blank to cancel)" -f $Prompt)
+            if (-not $userInput) { return $null }
+            $userInput = $userInput.Trim()
+            $userInput = $userInput.Trim('"','''')
+            
+            # Handle drag-and-drop format (may include extra quotes or spaces)
+            if ($userInput -match '^&\s*(.+)$') {
+                $userInput = $matches[1].Trim().Trim('"','''')
+            }
+            
             try {
-                $resolved = Resolve-Path -LiteralPath $input -ErrorAction Stop
+                $resolved = Resolve-Path -LiteralPath $userInput -ErrorAction Stop
                 $first = $resolved | Select-Object -First 1
-                if (Test-Path -LiteralPath $first.Path -PathType Leaf) { return $first.Path } else { Write-Host "Path is not a file. Try again or leave blank to cancel." -ForegroundColor Yellow }
-            } catch { Write-Host "Path not found. Try again or leave blank to cancel." -ForegroundColor Yellow }
+                if (Test-Path -LiteralPath $first.Path -PathType Leaf) {
+                    $selectedFile = $first.Path
+                    break
+                } else {
+                    Write-Host "Error: Path is not a file. Please try again or leave blank to cancel." -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "Error: Path not found. Please verify the path and try again (or leave blank to cancel)." -ForegroundColor Yellow
+            }
         }
     }
+
+    # Show file info if selected and requested
+    if ($selectedFile -and $ShowFileInfo) {
+        try {
+            $fileInfo = Get-Item -LiteralPath $selectedFile
+            $fileSize = Format-FileSize -Bytes $fileInfo.Length
+            $lastModified = $fileInfo.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+            
+            Write-Host ""
+            Write-Host "Selected File:" -ForegroundColor Cyan
+            Write-Host ("  Name: {0}" -f $fileInfo.Name) -ForegroundColor White
+            Write-Host ("  Size: {0} ({1:N0} bytes)" -f $fileSize, $fileInfo.Length) -ForegroundColor White
+            Write-Host ("  Modified: {0}" -f $lastModified) -ForegroundColor White
+            Write-Host ("  Path: {0}" -f $selectedFile) -ForegroundColor DarkGray
+            
+            # Warn for very large files (>1GB)
+            if ($fileInfo.Length -gt 1GB) {
+                Write-Host ""
+                Write-Host ("WARNING: Large file ({0}). Processing may take several minutes." -f $fileSize) -ForegroundColor Yellow
+                $confirm = Read-Host "Continue? (Y/N) [Y]"
+                if ($confirm -match '^[nN]') {
+                    Write-Host "Cancelled by user." -ForegroundColor Yellow
+                    return $null
+                }
+            }
+        } catch {
+            Write-LogMessage -Message ("Failed to get file info: {0}" -f $_.Exception.Message) -Level WARN
+        }
+    }
+
+    return $selectedFile
 }
 #endregion
 
@@ -258,11 +452,17 @@ function Select-AlgorithmMenu {
         Write-Host "  3) SHA-256"
         Write-Host "  4) SHA-384"
         Write-Host "  5) SHA-512"
-        Write-Host "  6) Cancel / Back"
-        $choice = Read-Host ("Choose an option (1-6) [Default: {0}]" -f $Default)
+        Write-Host "  0) Cancel / Back"
+        Write-Host ""
+        Write-Host "Press ESC to cancel" -ForegroundColor DarkGray
+        Write-Host ("{0} (0-5) [Default: {1}]:" -f $Prompt, $Default)
+        
+        $choice = Read-SingleKey
+        try { $choice = [string]$choice; $choice = $choice.Trim() } catch {}
         if ([string]::IsNullOrWhiteSpace($choice)) { return $Default }
+        if ($choice -eq [char]27 -or $choice -match '^\x1B') { return $null }
         if ($map.ContainsKey($choice)) { return $map[$choice] }
-        if ($choice -eq '6') { return $null }
+        if ($choice -eq '0') { return $null }
         Write-Host "Invalid choice, try again." -ForegroundColor Yellow
     }
 }
@@ -273,8 +473,8 @@ function Get-FileChecksumEx {
     [CmdletBinding(DefaultParameterSetName='ByPath')]
     param(
         [Parameter(Mandatory=$true, Position=0)][ValidateNotNullOrEmpty()][string] $Path,
-        [Parameter(Mandatory=$true)][ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512')][string] $Algorithm = 'SHA256',
-        [Parameter(Mandatory=$false)][int] $BufferSize = (4 * 1MB),
+        [Parameter(Mandatory=$false)][ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512')][string] $Algorithm = 'SHA256',
+        [Parameter(Mandatory=$false)][ValidateRange(4096, [int]::MaxValue)][int] $BufferSize = (4 * 1MB),
         [Parameter(Mandatory=$false)][switch] $ShowProgress
     )
 
@@ -289,7 +489,12 @@ function Get-FileChecksumEx {
     process {
         $fs = $null; $hashAlgo = $null
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $originalTitle = $null
+        
         try {
+            # Save original window title
+            try { $originalTitle = $Host.UI.RawUI.WindowTitle } catch { }
+            
             $hashAlgo = [System.Security.Cryptography.HashAlgorithm]::Create($Algorithm)
             if (-not $hashAlgo) { Throw "Unable to create hash algorithm '$Algorithm'." }
 
@@ -319,10 +524,16 @@ function Get-FileChecksumEx {
                         $etaSec = if ($speedBytesPerSec -gt 0) { [math]::Round($remainingBytes / $speedBytesPerSec) } else { 0 }
                         $remainingMB = [math]::Round([double]$remainingBytes / 1MB, 2)
                         $totalMB = [math]::Round([double]$length / 1MB, 2)
+                        $speedMBps = [math]::Round($speedBytesPerSec / 1MB, 2)
 
-                        Write-Progress -Id $progressId -Activity ("Calculating {0}" -f $Algorithm) `
-                                       -Status ("{0:N2}% — {1} MB remaining of {2} MB. ETA: {3}s" -f $percent, $remainingMB, $totalMB, $etaSec) `
+                        Write-Progress -Id $progressId -Activity ("Calculating {0} checksum" -f $Algorithm) `
+                                       -Status ("{0:N2}% - {1} MB of {2} MB @ {3} MB/s - ETA: {4}s" -f $percent, $remainingMB, $totalMB, $speedMBps, $etaSec) `
                                        -PercentComplete ([math]::Min(100, [math]::Round($percent, 2)))
+                        
+                        # Update window title with progress
+                        try {
+                            $Host.UI.RawUI.WindowTitle = ("{0} - {1:N1}% - {2}" -f $Algorithm, $percent, (Split-Path -Leaf $Path))
+                        } catch { }
 
                         $lastUpdate = $now
                         $lastPercent = $percent
@@ -336,7 +547,7 @@ function Get-FileChecksumEx {
 
             $sw.Stop()
 
-            Log-Message -Message ("Checksum calculated for {0} ({1})" -f $Path, $Algorithm) -Level INFO
+            Write-LogMessage -Message ("Checksum calculated for {0} ({1})" -f $Path, $Algorithm) -Level INFO
 
             [PSCustomObject]@{
                 Path      = (Get-Item -LiteralPath $Path).FullName
@@ -347,12 +558,17 @@ function Get-FileChecksumEx {
             }
 
         } catch {
-            Log-Message -Message ("Error computing checksum: {0}" -f $_.Exception.Message) -Level ERROR
+            Write-LogMessage -Message ("Error computing checksum: {0}" -f $_.Exception.Message) -Level ERROR
             Throw "Error computing checksum: $($_.Exception.Message)"
         } finally {
             if ($fs) { try { $fs.Close(); $fs.Dispose() } catch {} }
             if ($hashAlgo) { $hashAlgo.Dispose() }
             if ($ShowProgress) { Write-Progress -Id $progressId -Activity ("Calculating {0}" -f $Algorithm) -Completed }
+            
+            # Restore original window title
+            if ($originalTitle) {
+                try { $Host.UI.RawUI.WindowTitle = $originalTitle } catch { }
+            }
         }
     }
 }
@@ -368,7 +584,7 @@ function Get-ChecksumAlgorithmFromLength { param([string] $Checksum)
     }
 }
 
-function Normalize-ChecksumString {
+function ConvertTo-NormalizedChecksum {
     param([Parameter(Mandatory=$true)][string] $Raw)
     if (-not $Raw) { return $null }
 
@@ -388,7 +604,7 @@ function Normalize-ChecksumString {
     return $null
 }
 
-function Extract-ChecksumFromFile {
+function Get-ChecksumFromFile {
     param(
         [Parameter(Mandatory=$true)][string] $Path,
         [Parameter(Mandatory=$false)][string] $TargetFilename
@@ -519,13 +735,29 @@ function Extract-ChecksumFromFile {
 function Test-FileChecksum {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory=$true)][string] $Path,
-        [Parameter(Mandatory=$true)][string] $ExpectedChecksumOrFile,
-        [Parameter(Mandatory=$false)][ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512')][string] $Algorithm,
-        [Parameter(Mandatory=$false)][switch] $AutoDetectAlgorithm,
-        [Parameter(Mandatory=$false)][switch] $ShowProgress,
-        [Parameter(Mandatory=$false)][switch] $SaveOnMismatch,
-        [Parameter(Mandatory=$false)][string] $OutputPath
+        [Parameter(Mandatory=$true)]
+        [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
+        [string] $Path,
+        
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string] $ExpectedChecksumOrFile,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512')]
+        [string] $Algorithm,
+        
+        [Parameter(Mandatory=$false)]
+        [switch] $AutoDetectAlgorithm,
+        
+        [Parameter(Mandatory=$false)]
+        [switch] $ShowProgress,
+        
+        [Parameter(Mandatory=$false)]
+        [switch] $SaveOnMismatch,
+        
+        [Parameter(Mandatory=$false)]
+        [string] $OutputPath
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Throw "Target file not found: $Path" }
@@ -535,11 +767,11 @@ function Test-FileChecksum {
 
     # If the provided ExpectedChecksumOrFile is a path to a file, attempt to parse it; otherwise treat as literal/pasted
     if (Test-Path -LiteralPath $ExpectedChecksumOrFile -PathType Leaf) {
-        Log-Message -Message ("Parsing checksum from file: {0}" -f $ExpectedChecksumOrFile) -Level INFO
+        Write-LogMessage -Message ("Parsing checksum from file: {0}" -f $ExpectedChecksumOrFile) -Level INFO
         try {
-            $parsed = Extract-ChecksumFromFile -Path $ExpectedChecksumOrFile -TargetFilename (Split-Path -Leaf $Path)
+            $parsed = Get-ChecksumFromFile -Path $ExpectedChecksumOrFile -TargetFilename (Split-Path -Leaf $Path)
         } catch {
-            Log-Message -Message ("Checksum file parse failed: {0}" -f $_.Exception.Message) -Level WARN
+            Write-LogMessage -Message ("Checksum file parse failed: {0}" -f $_.Exception.Message) -Level WARN
             Throw "Could not parse checksum file: $ExpectedChecksumOrFile"
         }
 
@@ -548,13 +780,13 @@ function Test-FileChecksum {
             # If parser only returned algorithm hint, keep algorithm hint and let algorithm detection handle it
             $derivedAlgorithm = $parsed.Algorithm
         } else {
-            $expectedChecksum = Normalize-ChecksumString -Raw $parsed.Checksum
+            $expectedChecksum = ConvertTo-NormalizedChecksum -Raw $parsed.Checksum
             if (-not $expectedChecksum) { Throw "Extracted checksum is not valid hex." }
             $derivedAlgorithm = $parsed.Algorithm
         }
     } else {
         # Pasted value or user-typed value: normalize and treat as checksum
-        $norm = Normalize-ChecksumString -Raw $ExpectedChecksumOrFile
+        $norm = ConvertTo-NormalizedChecksum -Raw $ExpectedChecksumOrFile
         if (-not $norm) { Throw "Provided checksum string does not contain a valid hex checksum." }
         $expectedChecksum = $norm
     }
@@ -601,13 +833,13 @@ function Test-FileChecksum {
     try {
         $calc = Get-FileChecksumEx -Path $Path -Algorithm $chosenAlgorithm -ShowProgress:$ShowProgress -ErrorAction Stop
     } catch {
-        Log-Message -Message ("Checksum computation failed for {0} with algorithm {1}: {2}" -f $Path, $chosenAlgorithm, $_.Exception.Message) -Level ERROR
+        Write-LogMessage -Message ("Checksum computation failed for {0} with algorithm {1}: {2}" -f $Path, $chosenAlgorithm, $_.Exception.Message) -Level ERROR
         Throw "Failed to compute checksum: $($_.Exception.Message)"
     }
 
     # Normalize both for reliable comparison
-    if ($expectedChecksum) { $expectedChecksum = Normalize-ChecksumString -Raw $expectedChecksum }
-    $calculatedChecksum = Normalize-ChecksumString -Raw $calc.Checksum
+    if ($expectedChecksum) { $expectedChecksum = ConvertTo-NormalizedChecksum -Raw $expectedChecksum }
+    $calculatedChecksum = ConvertTo-NormalizedChecksum -Raw $calc.Checksum
 
     $match = $false
     if ($expectedChecksum -and $calculatedChecksum) { $match = ($calculatedChecksum -ieq $expectedChecksum) }
@@ -626,27 +858,29 @@ function Test-FileChecksum {
         if (-not $OutputPath) {
             $dir = Split-Path -Parent $Path
             $base = [IO.Path]::GetFileName($Path)
-            $OutputPath = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.checksum.txt" -f $base, $chosenAlgorithm, $env:USERNAME)
+            $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
+            $OutputPath = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $chosenAlgorithm, $suffix)
         }
         try {
             [System.IO.File]::WriteAllText($OutputPath, $calculatedChecksum, [System.Text.Encoding]::UTF8)
             $result | Add-Member -NotePropertyName SavedChecksumPath -NotePropertyValue $OutputPath -Force
-            Log-Message -Message ("Saved checksum to {0} due to mismatch" -f $OutputPath) -Level INFO
+            Write-LogMessage -Message ("Saved checksum to {0} due to mismatch" -f $OutputPath) -Level INFO
         } catch {
-            Log-Message -Message ("Failed to save checksum on mismatch: {0}" -f $_.Exception.Message) -Level WARN
+            Write-LogMessage -Message ("Failed to save checksum on mismatch: {0}" -f $_.Exception.Message) -Level WARN
         }
     }
 
-    Log-Message -Message ("Verification for {0}: match={1} (alg={2})" -f $Path, $result.Match, $chosenAlgorithm) -Level INFO
+    Write-LogMessage -Message ("Verification for {0}: match={1} (alg={2})" -f $Path, $result.Match, $chosenAlgorithm) -Level INFO
     return $result
 }
 
 function Save-ChecksumQuick { param([string] $TargetPath,[string] $Checksum)
-    try { [System.IO.File]::WriteAllText($TargetPath,$Checksum,[System.Text.Encoding]::UTF8); return $true } catch { Log-Message -Message ("Quick save failed for {0}: {1}" -f $TargetPath,$_.Exception.Message) -Level WARN; return $false }
+    try { [System.IO.File]::WriteAllText($TargetPath,$Checksum,[System.Text.Encoding]::UTF8); return $true } catch { Write-LogMessage -Message ("Quick save failed for {0}: {1}" -f $TargetPath,$_.Exception.Message) -Level WARN; return $false }
 }
 
 function Save-ChecksumWithMetadata { param([string] $TargetPath,[string] $Checksum,[string] $Algorithm,[string] $FilePath)
-    $now = (Get-Date).ToString("u"); $user = $env:USERNAME
+    $now = (Get-Date).ToString("u")
+    $user = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "[Not recorded - Privacy setting]" }
     $content = @"
 File:      $FilePath
 Algorithm: $Algorithm
@@ -655,24 +889,75 @@ Checksum:  $Checksum
 CreatedBy: $user
 CreatedOn: $now
 "@
-    try { [System.IO.File]::WriteAllText($TargetPath,$content,[System.Text.Encoding]::UTF8); return $true } catch { Log-Message -Message ("Metadata save failed for {0}: {1}" -f $TargetPath,$_.Exception.Message) -Level WARN; return $false }
+    try { [System.IO.File]::WriteAllText($TargetPath,$content,[System.Text.Encoding]::UTF8); return $true } catch { Write-LogMessage -Message ("Metadata save failed for {0}: {1}" -f $TargetPath,$_.Exception.Message) -Level WARN; return $false }
+}
+#endregion
+
+#region View log entries
+function Show-RecentLogEntries {
+    param([int] $Count = 50)
+    
+    if (-not (Test-Path -Path $Global:LogFile)) {
+        Write-Host "No log file found." -ForegroundColor Yellow
+        Start-Sleep -Milliseconds 1000
+        return
+    }
+    
+    try {
+        $lines = Get-Content -Path $Global:LogFile -Tail $Count -ErrorAction Stop
+        
+        Clear-Host
+        Write-Host ("Recent Log Entries (last {0} lines)" -f $Count) -ForegroundColor Cyan
+        Write-Host ("Log file: {0}" -f $Global:LogFile) -ForegroundColor DarkGray
+        Write-Host ""
+        
+        foreach ($line in $lines) {
+            try {
+                $entry = $line | ConvertFrom-Json -ErrorAction Stop
+                $color = switch ($entry.level) {
+                    'CRITICAL' { 'Magenta' }
+                    'ERROR'    { 'Red' }
+                    'WARN'     { 'Yellow' }
+                    'INFO'     { 'White' }
+                    'DEBUG'    { 'DarkGray' }
+                    default    { 'White' }
+                }
+                Write-Host ("{0} [{1}] {2}" -f $entry.timestamp, $entry.level, $entry.message) -ForegroundColor $color
+            } catch {
+                # Not JSON, display raw
+                Write-Host $line -ForegroundColor DarkGray
+            }
+        }
+        
+        Write-Host ""
+    } catch {
+        Write-Host "Error reading log file: $($_.Exception.Message)" -ForegroundColor Red
+    }
 }
 #endregion
 
 #region Interactive single-key main menu (host-aware, concise)
 function Read-SingleKey {
-    param([string] $Prompt = $null)
+    param(
+        [string] $Prompt = $null,
+        [switch] $AllowEscape
+    )
     if ($Prompt) { Write-Host $Prompt }
-    try { $ck = [Console]::ReadKey($true); return $ck.KeyChar } catch {
+    try { 
+        $ck = [Console]::ReadKey($true)
+        if ($AllowEscape -and $ck.Key -eq [ConsoleKey]::Escape) { return [char]27 }
+        return $ck.KeyChar 
+    } catch {
         try {
             while ($true) {
                 $k = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                if ($AllowEscape -and $k.VirtualKeyCode -eq 27) { return [char]27 }
                 if ($k.Character -and ($k.Character -ne [char]0)) { return $k.Character }
             }
         } catch {
             # Final fallback: Read-Host with no explicit -Prompt (works in ISE)
-            $input = Read-Host
-            if ($input) { return $input[0] } else { return '' }
+            $userInput = Read-Host
+            if ($userInput) { return $userInput[0] } else { return '' }
         }
     }
 }
@@ -681,20 +966,60 @@ function Show-MainMenuAndReadKey {
     Clear-Host
     $userDisplay = if ($env:USERNAME) { $env:USERNAME } else { 'Unknown User' }
     $autoCopyStatus = if ($Global:Settings.AutoCopyToClipboard) { 'On' } else { 'Off' }
+    $recentCount = if ($Global:Settings.RecentFiles) { $Global:Settings.RecentFiles.Count } else { 0 }
     $promptSuffix = if ($Host.Name -eq 'ConsoleHost') { 'no Enter required' } else { 'press number then Enter' }
 
-    Write-Host ("Checksum Tool v{0} — User: {1}    AutoCopy: {2}" -f $ScriptVersion, $userDisplay, $autoCopyStatus) -ForegroundColor Cyan
+    Write-Host ("Checksum Tool v{0} - User: {1}    AutoCopy: {2}" -f $ScriptVersion, $userDisplay, $autoCopyStatus) -ForegroundColor Cyan
     Write-Host ""
     Write-Host "1) Calculate checksum"
     Write-Host "2) Verify checksum (auto-detect algorithm, supports pasted value or checksum-file)"
     Write-Host "3) Verify checksum (specify algorithm, supports pasted value or checksum-file)"
-    Write-Host "4) Preferences"
-    Write-Host "5) Exit"
+    Write-Host ("4) Recent files ({0} available)" -f $recentCount)
+    Write-Host "5) Preferences"
+    Write-Host "6) Privacy & Data Management"
+    Write-Host "7) Exit"
     Write-Host ""
     Write-Host ("Press the number key for your choice ({0})." -f $promptSuffix)
     $key = Read-SingleKey
     try { $key = [string]$key; $key = $key.Trim() } catch {}
     return $key
+}
+
+function Show-PrivacyMenu {
+    Clear-Host
+    Write-Host "Privacy & Data Management (GDPR Compliance)" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Data Storage Locations:" -ForegroundColor Yellow
+    Write-Host ("  Settings: {0}" -f (Get-SettingsFilePath))
+    Write-Host ("  Log File: {0}" -f $Global:LogFile)
+    Write-Host ""
+    
+    $recentCount = if ($Global:Settings.RecentFiles) { $Global:Settings.RecentFiles.Count } else { 0 }
+    $includeUsername = if ($Global:Settings.IncludeUsernameInMetadata) { "Yes" } else { "No (Privacy Protected)" }
+    $anonymizeLogs = if ($Global:Settings.AnonymizeLogPaths) { "Yes (Privacy Protected)" } else { "No" }
+    
+    Write-Host "Current Privacy Settings:" -ForegroundColor Yellow
+    Write-Host ("  Include username in file metadata: {0}" -f $includeUsername)
+    Write-Host ("  Anonymize file paths in logs: {0}" -f $anonymizeLogs)
+    Write-Host ("  Recent files stored: {0}" -f $recentCount)
+    Write-Host ""
+    
+    Write-Host "Privacy Options:" -ForegroundColor Yellow
+    Write-Host "1) Toggle username in file metadata (currently: $includeUsername)"
+    Write-Host "2) Toggle path anonymization in logs (currently: $anonymizeLogs)"
+    Write-Host "3) View all stored data"
+    Write-Host "4) Clear recent files history"
+    Write-Host "5) Clear all logs"
+    Write-Host "6) Export all data (JSON)"
+    Write-Host "7) Delete ALL stored data (settings, logs, history)"
+    Write-Host "0) Back to main menu"
+    Write-Host ""
+    Write-Host "Press ESC to cancel" -ForegroundColor DarkGray
+    Write-Host "Choose an option (0-7):"
+    
+    $choice = Read-SingleKey
+    try { $choice = [string]$choice; $choice = $choice.Trim() } catch {}
+    return $choice
 }
 #endregion
 
@@ -704,23 +1029,30 @@ while ($true) {
 
     switch ($k) {
         '1' {
-            $file = Select-File -Prompt "Choose file to calculate checksum"
+            $file = Select-File -Prompt "Choose file to calculate checksum" -ShowFileInfo
             if (-not $file) { Write-Host "No file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+
+            Add-RecentFile -FilePath $file
 
             $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm" -Default "SHA256"
             if (-not $alg) { Write-Host "Cancelled algorithm selection." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
 
-            Log-Message -Message ("User requested checksum for {0} using {1}" -f $file, $alg) -Level INFO
+            Write-LogMessage -Message ("User requested checksum for {0} using {1}" -f $file, $alg) -Level INFO
             $res = Get-FileChecksumEx -Path $file -Algorithm $alg -ShowProgress
+            
+            $fileSize = Format-FileSize -Bytes $res.Length
+            Write-Host ""
+            Write-Host ("File: {0} ({1})" -f (Split-Path -Leaf $file), $fileSize) -ForegroundColor Cyan
             Write-Host ("Checksum ({0}): {1}" -f $res.Algorithm, $res.Checksum) -ForegroundColor Green
+            Write-Host ("Time elapsed: {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
 
             if ($Global:Settings.AutoCopyToClipboard) {
                 if (Copy-ToClipboard -Text $res.Checksum) {
                     Write-Host "Checksum automatically copied to clipboard (preference enabled)." -ForegroundColor Yellow
-                    Log-Message -Message "Checksum copied to clipboard automatically" -Level INFO
+                    Write-LogMessage -Message "Checksum copied to clipboard automatically" -Level INFO
                 } else {
                     Write-Host "Auto-copy failed (see verbose)." -ForegroundColor Red
-                    Log-Message -Message "Auto-copy failed" -Level WARN
+                    Write-LogMessage -Message "Auto-copy failed" -Level WARN
                 }
             }
 
@@ -732,26 +1064,28 @@ while ($true) {
                 'C' {
                     if (Copy-ToClipboard -Text $res.Checksum) {
                         Write-Host "Checksum copied to clipboard." -ForegroundColor Yellow
-                        Log-Message -Message "Checksum copied to clipboard by user" -Level INFO
+                        Write-LogMessage -Message "Checksum copied to clipboard by user" -Level INFO
                     } else {
                         Write-Host "Copy to clipboard failed (see verbose)." -ForegroundColor Red
-                        Log-Message -Message "User copy to clipboard failed" -Level WARN
+                        Write-LogMessage -Message "User copy to clipboard failed" -Level WARN
                     }
                 }
                 'F' {
                     $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.checksum.txt" -f $base, $res.Algorithm, $env:USERNAME)
+                    $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
+                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $res.Algorithm, $suffix)
                     if (Save-ChecksumQuick -TargetPath $out -Checksum $res.Checksum) {
                         Write-Host "Quick-saved checksum to: $out" -ForegroundColor Yellow
-                        Log-Message -Message ("Quick-saved checksum to {0}" -f $out) -Level INFO
+                        Write-LogMessage -Message ("Quick-saved checksum to {0}" -f $out) -Level INFO
                     } else { Write-Host "Quick-save failed." -ForegroundColor Red }
                 }
                 'M' {
                     $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.checksum.txt" -f $base, $res.Algorithm, $env:USERNAME)
+                    $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
+                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $res.Algorithm, $suffix)
                     if (Save-ChecksumWithMetadata -TargetPath $out -Checksum $res.Checksum -Algorithm $res.Algorithm -FilePath $res.Path) {
                         Write-Host "Saved checksum with metadata to: $out" -ForegroundColor Yellow
-                        Log-Message -Message ("Saved checksum with metadata to {0}" -f $out) -Level INFO
+                        Write-LogMessage -Message ("Saved checksum with metadata to {0}" -f $out) -Level INFO
                     } else { Write-Host "Save with metadata failed." -ForegroundColor Red }
                 }
                 default { Write-Host "No action taken." -ForegroundColor DarkGray }
@@ -762,8 +1096,10 @@ while ($true) {
 
         '2' {
             # Verify checksum (auto-detect algorithm)
-            $file = Select-File -Prompt "Choose file to verify checksum"
+            $file = Select-File -Prompt "Choose file to verify checksum" -ShowFileInfo
             if (-not $file) { Write-Host "No file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+
+            Add-RecentFile -FilePath $file
 
             if ($Global:Settings.UseFileDialog) {
                 # GUI/file-dialog mode: explicit choice between paste or pick checksum file
@@ -780,43 +1116,60 @@ while ($true) {
                     if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
                 }
             } else {
-                # Typed-path mode: single prompt — user may paste checksum OR type a checksum-file path
+                # CLI mode: single prompt - user may paste checksum OR type a checksum-file path
                 $inputValue = Read-Host "Enter expected checksum or full path to a checksum file (leave blank to cancel)"
                 if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
             }
 
-            Log-Message -Message ("User requested verify (auto-detect) for {0}" -f $file) -Level INFO
+            Write-LogMessage -Message ("User requested verify (auto-detect) for {0}" -f $file) -Level INFO
             try {
                 $res = Test-FileChecksum -Path $file -ExpectedChecksumOrFile $inputValue -AutoDetectAlgorithm -ShowProgress
             } catch {
-                Write-Host "Verification failed: $($_.Exception.Message)" -ForegroundColor Red
-                Log-Message -Message ("Verification error: {0}" -f $_.Exception.Message) -Level ERROR
+                Write-Host ""
+                Write-Host "Verification Failed" -ForegroundColor Red
+                Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "Possible solutions:" -ForegroundColor Cyan
+                Write-Host "  - Ensure the checksum file is in a supported format" -ForegroundColor White
+                Write-Host "  - Try specifying the algorithm manually (option 3)" -ForegroundColor White
+                Write-Host "  - Check that the checksum value is valid hexadecimal" -ForegroundColor White
+                Write-LogMessage -Message ("Verification error: {0}" -f $_.Exception.Message) -Level ERROR
                 Read-Host "Press Enter to continue..."
                 continue
             }
 
             if ($res.Match) {
-                Write-Host "Match!" -ForegroundColor Green
+                Write-Host ""
+                Write-Host "[OK] MATCH - Checksum Verified Successfully!" -ForegroundColor Green
+                Write-Host ("  Algorithm: {0}" -f $res.Algorithm) -ForegroundColor White
+                Write-Host ("  Checksum:  {0}" -f $res.Calculated) -ForegroundColor DarkGray
+                Write-Host ""
                 if ($Global:Settings.AutoCopyToClipboard) {
-                    if (Copy-ToClipboard -Text $res.Calculated) { Write-Host "Calculated checksum copied to clipboard (preference enabled)." -ForegroundColor Yellow } else { Write-Host "Auto-copy failed." -ForegroundColor Red }
+                    if (Copy-ToClipboard -Text $res.Calculated) { Write-Host "Checksum copied to clipboard (auto-copy enabled)." -ForegroundColor Yellow } else { Write-Host "Auto-copy failed." -ForegroundColor Red }
                 } else {
                     $copy = Read-Host "Copy calculated checksum to clipboard? (Y/N) [N]"
                     if ($copy -match '^[yY]') { if (Copy-ToClipboard -Text $res.Calculated) { Write-Host "Copied." -ForegroundColor Yellow } else { Write-Host "Copy failed." -ForegroundColor Red } }
                 }
             } else {
-                Write-Host ("Mismatch. Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
+                Write-Host ""
+                Write-Host "[FAIL] MISMATCH - Checksum Does Not Match!" -ForegroundColor Red
+                Write-Host ("  Expected:   {0}" -f $res.ExpectedChecksum) -ForegroundColor Yellow
+                Write-Host ("  Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
+                Write-Host ""
                 Write-Host "Actions: (C)opy to Clipboard  (F)ile quick-save  (M)etadata save  (N)one"
                 $save = Read-Host "Choose an action (C/F/M/N) [N]"
                 switch (($save).ToUpper()) {
                     'C' { if (Copy-ToClipboard -Text $res.Calculated) { Write-Host "Copied to clipboard." -ForegroundColor Yellow } else { Write-Host "Copy failed." -ForegroundColor Red } }
                     'F' {
                         $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.checksum.txt" -f $base, $res.Algorithm, $env:USERNAME)
+                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
+                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $res.Algorithm, $suffix)
                         if (Save-ChecksumQuick -TargetPath $out -Checksum $res.Calculated) { Write-Host "Saved: $out" -ForegroundColor Yellow } else { Write-Host "Save failed." -ForegroundColor Red }
                     }
                     'M' {
                         $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.checksum.txt" -f $base, $res.Algorithm, $env:USERNAME)
+                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
+                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $res.Algorithm, $suffix)
                         if (Save-ChecksumWithMetadata -TargetPath $out -Checksum $res.Calculated -Algorithm $res.Algorithm -FilePath $res.Path) { Write-Host "Saved: $out" -ForegroundColor Yellow } else { Write-Host "Save failed." -ForegroundColor Red }
                     }
                     default { Write-Host "Not saved." -ForegroundColor DarkGray }
@@ -828,8 +1181,10 @@ while ($true) {
 
         '3' {
             # Verify checksum with explicit algorithm
-            $file = Select-File -Prompt "Choose file to verify checksum (specify algorithm)"
+            $file = Select-File -Prompt "Choose file to verify checksum (specify algorithm)" -ShowFileInfo
             if (-not $file) { Write-Host "No file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+
+            Add-RecentFile -FilePath $file
 
             $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm for verification" -Default "SHA256"
             if (-not $alg) { Write-Host "Cancelled algorithm selection." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
@@ -848,26 +1203,111 @@ while ($true) {
                     if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
                 }
             } else {
-                # Typed-path mode: single prompt (paste checksum or type path)
+                # CLI mode: single prompt (paste checksum or type path)
                 $inputValue = Read-Host "Enter expected checksum or full path to a checksum file (leave blank to cancel)"
                 if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
             }
 
-            Log-Message -Message ("User requested verify (explicit {0}) for {1}" -f $alg, $file) -Level INFO
+            Write-LogMessage -Message ("User requested verify (explicit {0}) for {1}" -f $alg, $file) -Level INFO
             try {
                 $res = Test-FileChecksum -Path $file -ExpectedChecksumOrFile $inputValue -Algorithm $alg -ShowProgress
             } catch {
-                Write-Host "Verification failed: $($_.Exception.Message)" -ForegroundColor Red
-                Log-Message -Message ("Verification error: {0}" -f $_.Exception.Message) -Level ERROR
+                Write-Host ""
+                Write-Host "Verification Failed" -ForegroundColor Red
+                Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "Possible solutions:" -ForegroundColor Cyan
+                Write-Host "  - Verify the checksum value matches the selected algorithm length" -ForegroundColor White
+                Write-Host ("    ({0} requires specific checksum length)" -f $alg) -ForegroundColor DarkGray
+                Write-Host "  - Check that the checksum file format is correct" -ForegroundColor White
+                Write-Host "  - Ensure the checksum is valid hexadecimal" -ForegroundColor White
+                Write-LogMessage -Message ("Verification error: {0}" -f $_.Exception.Message) -Level ERROR
                 Read-Host "Press Enter to continue..."
                 continue
             }
 
-            if ($res.Match) { Write-Host "Match!" -ForegroundColor Green } else { Write-Host "Mismatch." -ForegroundColor Red }
+            if ($res.Match) {
+                Write-Host ""
+                Write-Host "[OK] MATCH - Checksum Verified Successfully!" -ForegroundColor Green
+                Write-Host ("  Algorithm: {0}" -f $res.Algorithm) -ForegroundColor White
+                Write-Host ("  Checksum:  {0}" -f $res.Calculated) -ForegroundColor DarkGray
+            } else {
+                Write-Host ""
+                Write-Host "[FAIL] MISMATCH - Checksum Does Not Match!" -ForegroundColor Red
+                Write-Host ("  Expected:  {0}" -f $res.ExpectedChecksum) -ForegroundColor Yellow
+                Write-Host ("  Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
+            }
             Read-Host "Press Enter to continue..."
         }
 
         '4' {
+            # Recent files
+            $file = Show-RecentFilesMenu
+            if (-not $file) { continue }
+            
+            # Quick action menu for recent file
+            Clear-Host
+            Write-Host ("Selected: {0}" -f (Split-Path -Leaf $file)) -ForegroundColor Cyan
+            Write-Host ("Path: {0}" -f $file) -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "1) Calculate checksum"
+            Write-Host "2) Verify checksum (auto-detect)"
+            Write-Host "3) Verify checksum (specify algorithm)"
+            Write-Host "4) Cancel"
+            Write-Host ""
+            $action = Read-Host "Choose action (1-4)"
+            
+            if ($action -eq '1') {
+                $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm" -Default "SHA256"
+                if (-not $alg) { Write-Host "Cancelled." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
+                
+                Write-LogMessage -Message ("User requested checksum for recent file {0} using {1}" -f $file, $alg) -Level INFO
+                $res = Get-FileChecksumEx -Path $file -Algorithm $alg -ShowProgress
+                
+                $fileSize = Format-FileSize -Bytes $res.Length
+                Write-Host ""
+                Write-Host ("File: {0} ({1})" -f (Split-Path -Leaf $file), $fileSize) -ForegroundColor Cyan
+                Write-Host ("Checksum ({0}): {1}" -f $res.Algorithm, $res.Checksum) -ForegroundColor Green
+                Write-Host ("Time elapsed: {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+                
+                if ($Global:Settings.AutoCopyToClipboard) {
+                    if (Copy-ToClipboard -Text $res.Checksum) {
+                        Write-Host "Checksum automatically copied to clipboard." -ForegroundColor Yellow
+                    }
+                }
+                
+                Read-Host "Press Enter to continue..."
+            } elseif ($action -eq '2' -or $action -eq '3') {
+                $alg = $null
+                if ($action -eq '3') {
+                    $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm for verification" -Default "SHA256"
+                    if (-not $alg) { Write-Host "Cancelled." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
+                }
+                
+                $inputValue = Read-Host "Enter expected checksum or path to checksum file"
+                if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+                
+                try {
+                    if ($alg) {
+                        $res = Test-FileChecksum -Path $file -ExpectedChecksumOrFile $inputValue -Algorithm $alg -ShowProgress
+                    } else {
+                        $res = Test-FileChecksum -Path $file -ExpectedChecksumOrFile $inputValue -AutoDetectAlgorithm -ShowProgress
+                    }
+                    
+                    if ($res.Match) {
+                        Write-Host "Match!" -ForegroundColor Green
+                    } else {
+                        Write-Host ("Mismatch! Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
+                    }
+                } catch {
+                    Write-Host "Verification failed: $($_.Exception.Message)" -ForegroundColor Red
+                }
+                
+                Read-Host "Press Enter to continue..."
+            }
+        }
+
+        '5' {
             $inPrefs = $true
             while ($inPrefs) {
                 Clear-Host
@@ -875,7 +1315,7 @@ while ($true) {
                 $prefAutoCopy = if ($Global:Settings.AutoCopyToClipboard) { 'On' } else { 'Off' }
                 $prefInterval = $Global:Settings.ProgressUpdateIntervalMs
                 $prefMinDelta = $Global:Settings.ProgressMinDeltaPercent
-                $prefFileDlg = if ($Global:Settings.UseFileDialog) { 'Explorer dialog' } else { 'Typed path' }
+                $prefFileDlg = if ($Global:Settings.UseFileDialog) { 'GUI (File Explorer)' } else { 'CLI (Type/Paste Path)' }
                 $prefLogDir = $Global:Settings.LogDirectory
 
                 Write-Host ("1) AutoCopyToClipboard: {0}" -f $prefAutoCopy)
@@ -883,9 +1323,11 @@ while ($true) {
                 Write-Host ("3) Progress minimum delta percent: {0}" -f $prefMinDelta)
                 Write-Host ("4) File selection method: {0}" -f $prefFileDlg)
                 Write-Host ("5) Set log directory (current: {0})" -f $prefLogDir)
-                Write-Host ("6) Back to main menu")
+                Write-Host ("6) View recent log entries")
+                Write-Host ("0) Back to main menu")
                 Write-Host ""
-                Write-Host "Press the number key to change that setting (host may require Enter). Changes are saved immediately."
+                Write-Host "Press ESC to cancel" -ForegroundColor DarkGray
+                Write-Host "Press the number key to change a setting (changes are saved immediately)."
 
                 $prefKey = Read-SingleKey
                 try { $prefKey = [string]$prefKey; $prefKey = $prefKey.Trim().ToUpper() } catch {}
@@ -896,10 +1338,10 @@ while ($true) {
                         $state = if ($Global:Settings.AutoCopyToClipboard) { 'On' } else { 'Off' }
                         if (Save-Settings -Settings $Global:Settings) {
                             Write-Host ("AutoCopyToClipboard set to: {0}" -f $state) -ForegroundColor Yellow
-                            Log-Message -Message ("AutoCopyToClipboard set to {0}" -f $state) -Level INFO
+                            Write-LogMessage -Message ("AutoCopyToClipboard set to {0}" -f $state) -Level INFO
                         } else {
                             Write-Host "Failed to save settings." -ForegroundColor Red
-                            Log-Message -Message "Failed to save AutoCopy change" -Level ERROR
+                            Write-LogMessage -Message "Failed to save AutoCopy change" -Level ERROR
                         }
                         Start-Sleep -Milliseconds 700
                     }
@@ -911,7 +1353,7 @@ while ($true) {
                                 $Global:Settings.ProgressUpdateIntervalMs = [int]$tmp
                                 if (Save-Settings -Settings $Global:Settings) {
                                     Write-Host ("Set ProgressUpdateIntervalMs to {0}" -f $Global:Settings.ProgressUpdateIntervalMs) -ForegroundColor Yellow
-                                    Log-Message -Message ("ProgressUpdateIntervalMs set to {0}" -f $tmp) -Level INFO
+                                    Write-LogMessage -Message ("ProgressUpdateIntervalMs set to {0}" -f $tmp) -Level INFO
                                 } else { Write-Host "Failed to save settings." -ForegroundColor Red }
                             } else { Write-Host "Invalid value; must be integer >= 50. No change." -ForegroundColor Yellow }
                         } else { Write-Host "No change." -ForegroundColor Yellow }
@@ -926,7 +1368,7 @@ while ($true) {
                                     $Global:Settings.ProgressMinDeltaPercent = $d
                                     if (Save-Settings -Settings $Global:Settings) {
                                         Write-Host ("Set ProgressMinDeltaPercent to {0}" -f $Global:Settings.ProgressMinDeltaPercent) -ForegroundColor Yellow
-                                        Log-Message -Message ("ProgressMinDeltaPercent set to {0}" -f $d) -Level INFO
+                                        Write-LogMessage -Message ("ProgressMinDeltaPercent set to {0}" -f $d) -Level INFO
                                     } else { Write-Host "Failed to save settings." -ForegroundColor Red }
                                 } else { Write-Host "Must be >= 0. No change." -ForegroundColor Yellow }
                             } catch { Write-Host "Invalid value; no change." -ForegroundColor Yellow }
@@ -935,10 +1377,10 @@ while ($true) {
                     }
                     '4' {
                         $Global:Settings.UseFileDialog = -not $Global:Settings.UseFileDialog
-                        $method = if ($Global:Settings.UseFileDialog) { 'Explorer dialog' } else { 'Typed path' }
+                        $method = if ($Global:Settings.UseFileDialog) { 'GUI (File Explorer)' } else { 'CLI (Type/Paste Path)' }
                         if (Save-Settings -Settings $Global:Settings) {
                             Write-Host ("File selection method set to: {0}" -f $method) -ForegroundColor Yellow
-                            Log-Message -Message ("File selection method set to {0}" -f $method) -Level INFO
+                            Write-LogMessage -Message ("File selection method set to {0}" -f $method) -Level INFO
                         } else { Write-Host "Failed to save settings." -ForegroundColor Red }
                         Start-Sleep -Milliseconds 700
                     }
@@ -952,12 +1394,12 @@ while ($true) {
                                 if (Test-Path $Global:Settings.LogDirectory) { $dlg.SelectedPath = $Global:Settings.LogDirectory }
                                 if ($dlg.ShowDialog() -eq 'OK') { $new = $dlg.SelectedPath }
                             } catch {
-                                Log-Message -Message ("Folder dialog failed: {0}" -f $_.Exception.Message) -Level WARN
+                                Write-LogMessage -Message ("Folder dialog failed: {0}" -f $_.Exception.Message) -Level WARN
                                 $new = $null
                             }
                         } else {
-                            $input = Read-Host ("Enter log directory full path (leave blank to cancel) [Current: {0}]" -f $Global:Settings.LogDirectory)
-                            if ($input) { $new = $input.Trim().Trim('"','''') } else { $new = $null }
+                            $userInput = Read-Host ("Enter log directory full path (leave blank to cancel) [Current: {0}]" -f $Global:Settings.LogDirectory)
+                            if ($userInput) { $new = $userInput.Trim().Trim('"','''') } else { $new = $null }
                         }
 
                         if ($new) {
@@ -968,21 +1410,155 @@ while ($true) {
                                 $Global:LogFile = Join-Path -Path $Global:LogDirectory -ChildPath "checksum_tool.log"
                                 if (Save-Settings -Settings $Global:Settings) {
                                     Write-Host ("LogDirectory set to: {0}" -f $new) -ForegroundColor Yellow
-                                    Log-Message -Message ("LogDirectory set to {0}" -f $new) -Level INFO
+                                    Write-LogMessage -Message ("LogDirectory set to {0}" -f $new) -Level INFO
                                 } else { Write-Host "Failed to save settings." -ForegroundColor Red }
                             } else { Write-Host "Unable to set log directory." -ForegroundColor Red }
                         } else { Write-Host "No change." -ForegroundColor Yellow }
                         Start-Sleep -Milliseconds 700
                     }
-                    '6' { $inPrefs = $false }
+                    '6' {
+                        Show-RecentLogEntries -Count 50
+                        Read-Host "Press Enter to continue..."
+                    }
+                    '0' { $inPrefs = $false }
                     default { Write-Host "Invalid option" -ForegroundColor Red; Start-Sleep -Milliseconds 700 }
                 }
             }
         }
 
-        '5' {
-            if (Save-Settings -Settings $Global:Settings) { Log-Message -Message "Settings saved on exit" -Level INFO }
-            Log-Message -Message "Checksum tool exiting" -Level INFO
+        '6' {
+            # Privacy & Data Management
+            while ($true) {
+                $choice = Show-PrivacyMenu
+                
+                if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq [char]27 -or $choice -match '^\x1B' -or $choice -eq '0') {
+                    break
+                }
+                
+                switch ($choice) {
+                    '1' {
+                        $Global:Settings.IncludeUsernameInMetadata = -not $Global:Settings.IncludeUsernameInMetadata
+                        $state = if ($Global:Settings.IncludeUsernameInMetadata) { 'Enabled' } else { 'Disabled (Privacy Protected)' }
+                        if (Save-Settings -Settings $Global:Settings) {
+                            Write-Host ("Username in metadata: {0}" -f $state) -ForegroundColor Yellow
+                            Write-LogMessage -Message ("Privacy: Username in metadata set to {0}" -f $Global:Settings.IncludeUsernameInMetadata) -Level INFO
+                        }
+                        Start-Sleep -Milliseconds 1000
+                    }
+                    '2' {
+                        $Global:Settings.AnonymizeLogPaths = -not $Global:Settings.AnonymizeLogPaths
+                        $state = if ($Global:Settings.AnonymizeLogPaths) { 'Enabled (Privacy Protected)' } else { 'Disabled' }
+                        if (Save-Settings -Settings $Global:Settings) {
+                            Write-Host ("Path anonymization in logs: {0}" -f $state) -ForegroundColor Yellow
+                            Write-LogMessage -Message ("Privacy: Path anonymization set to {0}" -f $Global:Settings.AnonymizeLogPaths) -Level INFO
+                        }
+                        Start-Sleep -Milliseconds 1000
+                    }
+                    '3' {
+                        Clear-Host
+                        Write-Host "All Stored Data" -ForegroundColor Cyan
+                        Write-Host ("=" * 70) -ForegroundColor DarkGray
+                        Write-Host ""
+                        Write-Host "Settings:" -ForegroundColor Yellow
+                        $Global:Settings | ConvertTo-Json -Depth 5 | Write-Host -ForegroundColor White
+                        Write-Host ""
+                        Read-Host "Press Enter to continue..."
+                    }
+                    '4' {
+                        $confirm = Read-Host "Clear recent files history? (Y/N) [N]"
+                        if ($confirm -match '^[yY]') {
+                            $Global:Settings.RecentFiles = @()
+                            if (Save-Settings -Settings $Global:Settings) {
+                                Write-Host "Recent files history cleared." -ForegroundColor Green
+                                Write-LogMessage -Message "User cleared recent files history" -Level INFO
+                            }
+                        } else {
+                            Write-Host "Cancelled." -ForegroundColor Yellow
+                        }
+                        Start-Sleep -Milliseconds 1000
+                    }
+                    '5' {
+                        $confirm = Read-Host "Clear all log files? This cannot be undone. (Y/N) [N]"
+                        if ($confirm -match '^[yY]') {
+                            try {
+                                if (Test-Path $Global:LogFile) { Remove-Item -Path $Global:LogFile -Force }
+                                for ($i = 1; $i -le $Global:MaxLogArchives; $i++) {
+                                    $archiveLog = "$Global:LogFile.$i.log"
+                                    if (Test-Path $archiveLog) { Remove-Item -Path $archiveLog -Force }
+                                }
+                                Write-Host "All log files cleared." -ForegroundColor Green
+                                Write-LogMessage -Message "User cleared all log files" -Level INFO
+                            } catch {
+                                Write-Host "Failed to clear logs: $($_.Exception.Message)" -ForegroundColor Red
+                            }
+                        } else {
+                            Write-Host "Cancelled." -ForegroundColor Yellow
+                        }
+                        Start-Sleep -Milliseconds 1000
+                    }
+                    '6' {
+                        try {
+                            $exportData = @{
+                                ExportDate = (Get-Date).ToString("o")
+                                Settings = $Global:Settings
+                                LogFile = $Global:LogFile
+                                ScriptVersion = $ScriptVersion
+                            }
+                            $json = $exportData | ConvertTo-Json -Depth 10
+                            $exportPath = Join-Path -Path ([Environment]::GetFolderPath('Desktop')) -ChildPath ("ChecksumTool_DataExport_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+                            [System.IO.File]::WriteAllText($exportPath, $json, [System.Text.Encoding]::UTF8)
+                            Write-Host ("Data exported to: {0}" -f $exportPath) -ForegroundColor Green
+                            Write-LogMessage -Message "User exported all data" -Level INFO
+                        } catch {
+                            Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
+                        }
+                        Start-Sleep -Milliseconds 1500
+                    }
+                    '7' {
+                        Write-Host ""
+                        Write-Host "WARNING: This will permanently delete:" -ForegroundColor Red
+                        Write-Host "  - All settings" -ForegroundColor Yellow
+                        Write-Host "  - All log files" -ForegroundColor Yellow
+                        Write-Host "  - Recent files history" -ForegroundColor Yellow
+                        Write-Host ""
+                        $confirm = Read-Host "Type 'DELETE' to confirm"
+                        if ($confirm -eq 'DELETE') {
+                            try {
+                                # Delete settings
+                                $settingsPath = Get-SettingsFilePath
+                                if (Test-Path $settingsPath) { Remove-Item -Path $settingsPath -Force }
+                                
+                                # Delete logs
+                                if (Test-Path $Global:LogFile) { Remove-Item -Path $Global:LogFile -Force }
+                                for ($i = 1; $i -le $Global:MaxLogArchives; $i++) {
+                                    $archiveLog = "$Global:LogFile.$i.log"
+                                    if (Test-Path $archiveLog) { Remove-Item -Path $archiveLog -Force }
+                                }
+                                
+                                Write-Host ""
+                                Write-Host "All data deleted. The tool will now exit." -ForegroundColor Green
+                                Start-Sleep -Seconds 2
+                                exit
+                            } catch {
+                                Write-Host "Deletion failed: $($_.Exception.Message)" -ForegroundColor Red
+                                Start-Sleep -Milliseconds 2000
+                            }
+                        } else {
+                            Write-Host "Cancelled." -ForegroundColor Yellow
+                            Start-Sleep -Milliseconds 1000
+                        }
+                    }
+                    default {
+                        Write-Host "Invalid option" -ForegroundColor Red
+                        Start-Sleep -Milliseconds 700
+                    }
+                }
+            }
+        }
+
+        '7' {
+            if (Save-Settings -Settings $Global:Settings) { Write-LogMessage -Message "Settings saved on exit" -Level INFO }
+            Write-LogMessage -Message "Checksum tool exiting" -Level INFO
             exit
         }
 

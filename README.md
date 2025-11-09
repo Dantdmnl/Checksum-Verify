@@ -4,7 +4,7 @@ Menu-driven PowerShell checksum tool (MD5/SHA1/SHA256/...) with clipboard & ISE 
 ## NOTES
 
 - **Author:** Ruben Draaisma
-- **Version:** 1.2.1
+- **Version:** 1.3.0
 - **Tested on:** Windows 11 24H2
 - **Tested with:** PowerShell ISE, PowerShell 5.1 and PowerShell 7
 
@@ -12,24 +12,29 @@ Menu-driven PowerShell checksum tool (MD5/SHA1/SHA256/...) with clipboard & ISE 
 
 ## Description
 
-A compact, interactive PowerShell-based checksum utility that supports streaming checksum calculation (MD5, SHA-1, SHA-256, SHA-384, SHA-512) with throttled progress reporting, persistent preferences, single-key menu navigation, and convenient clipboard/save actions.
+A compact, interactive PowerShell-based checksum utility that supports streaming checksum calculation (MD5, SHA-1, SHA-256, SHA-384, SHA-512) with throttled progress reporting, persistent preferences, single-key menu navigation, GDPR compliance, and convenient clipboard/save actions.
 
 The tool is designed to be used interactively (menu-driven) but also exposes functions you can call programmatically from other scripts.
 
 ## Key Features
 
-- Streaming checksum calculation for large files (MD5, SHA1, SHA256, SHA384, SHA512).
-- Throttled `Write-Progress` updates with configurable interval and minimum delta percent to avoid flooding the UI.
-- Int64-safe arithmetic for large file sizes.
-- Single-key main menu navigation (no Enter required) — works in regular console windows and PowerShell ISE.
-- Persistent settings stored in `%LOCALAPPDATA%\checksum-tool\settings.json`.
-- Clipboard copy support (prefers `Set-Clipboard`, falls back to Windows Forms clipboard).
-- File quick-save and save-with-metadata options.
-- Algorithm selection menu and automatic algorithm detection when verifying checksums.
-- GUI file selection dialogs (Windows Forms) for interactive file selection.
-- Typed path dialog for CLI based file selection.
-- Support for checksum files in various common formats
-- Logging.
+- **Checksum Algorithms**: Streaming calculation for large files (MD5, SHA1, SHA256, SHA384, SHA512)
+- **Performance**: Throttled `Write-Progress` updates with configurable interval and minimum delta percent
+- **Large File Support**: Int64-safe arithmetic for files over 2GB
+- **Single-Key Navigation**: No Enter required for menu selections (works in console and PowerShell ISE)
+- **Dual File Selection**: Choose between GUI (File Explorer) or CLI (Type/Paste/Drag-Drop) modes
+- **Recent Files**: Quick access to your last 10 processed files
+- **Enhanced Progress**: Real-time speed (MB/s), ETA, and progress in window title
+- **File Info Preview**: See file size, modified date, and large file warnings before processing
+- **Human-Readable Sizes**: Automatic formatting (TB, GB, MB, KB)
+- **Persistent Settings**: Stored in `%LOCALAPPDATA%\checksum-tool\settings.json`
+- **Clipboard Support**: Auto-copy calculated checksums with `Set-Clipboard` or Windows Forms fallback
+- **File Operations**: Quick-save and save-with-metadata options
+- **Algorithm Detection**: Automatic algorithm detection when verifying checksums
+- **Checksum File Support**: Parse various common checksum file formats
+- **GDPR Compliant**: Privacy-first defaults with full data management controls
+- **Logging**: Rotating logs with optional path anonymization
+- **PowerShell Best Practices**: All approved verbs, parameter validation, comprehensive error handling
 
 ## Prerequisites
 
@@ -59,8 +64,10 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
    - `1` Calculate checksum
    - `2` Verify checksum (auto-detect algorithm, supports pasted value or checksum-file)
    - `3` Verify checksum (specify algorithm, supports pasted value or checksum-file)
-   - `4` Preferences
-   - `5` Exit
+   - `4` Recent files (quick access to last 10 processed files)
+   - `5` Preferences
+   - `6` Privacy & Data Management
+   - `7` Exit
 3. Follow prompts and dialogs for file selection and actions.
 
 ### Example: programmatic usage
@@ -83,19 +90,35 @@ Settings are stored (JSON) in:
 %LOCALAPPDATA%\checksum-tool\settings.json
 ```
 
-Default keys: `AutoCopyToClipboard`, `ProgressUpdateIntervalMs`, `ProgressMinDeltaPercent`, `UseFileDialog`, `LogDirectory`.
+Default keys: `AutoCopyToClipboard`, `ProgressUpdateIntervalMs`, `ProgressMinDeltaPercent`, `UseFileDialog`, `LogDirectory`, `RecentFiles`, `MaxRecentFiles`, `IncludeUsernameInMetadata`, `AnonymizeLogPaths`.
 
 Example JSON:
 
 ```json
 {
-    "AutoCopyToClipboard":  true,
-    "ProgressUpdateIntervalMs":  200,
-    "ProgressMinDeltaPercent":  25,
-    "UseFileDialog":  true,
-    "LogDirectory":  "C:\\Users\\YourUser\\AppData\\Local\\checksum-tool"
+    "AutoCopyToClipboard": false,
+    "ProgressUpdateIntervalMs": 200,
+    "ProgressMinDeltaPercent": 0.25,
+    "UseFileDialog": true,
+    "LogDirectory": "C:\\Users\\YourUser\\AppData\\Local\\checksum-tool",
+    "RecentFiles": [],
+    "MaxRecentFiles": 10,
+    "IncludeUsernameInMetadata": false,
+    "AnonymizeLogPaths": true
 }
 ```
+
+## Privacy
+
+This tool is **GDPR compliant** with privacy-first defaults:
+
+- All data stored locally (no external transmission)
+- Path anonymization in logs (enabled by default)
+- Username in file metadata (disabled by default)
+- Full data management via Privacy menu (view, export, delete all data)
+- Transparent data storage locations
+
+See [PRIVACY.md](PRIVACY.md) for complete privacy policy.
 
 ## Troubleshooting
 
