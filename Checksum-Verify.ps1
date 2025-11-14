@@ -33,13 +33,13 @@
 
 .NOTES
     - Author: Ruben Draaisma
-    - Version: 1.3.0
+    - Version: 1.3.1
     - Tested on: Windows 11 24H2
     - Tested with: PowerShell ISE, PowerShell 5.1 and PowerShell 7
 #>
 
 #region Version & helper: settings path
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.3.1'
 
 function Get-SettingsFilePath {
     try {
@@ -65,6 +65,7 @@ function Get-DefaultSettings {
         MaxRecentFiles            = 10
         IncludeUsernameInMetadata = $false
         AnonymizeLogPaths         = $true
+        LargeFileSizeWarningGB    = 1.0
     }
 }
 #endregion
@@ -175,6 +176,11 @@ function ConvertTo-NormalizedSettings {
         $ld = $Obj.LogDirectory.Trim()
         $Obj.LogDirectory = $ld
     } catch { $Obj.LogDirectory = $defaults.LogDirectory }
+
+    try {
+        $gb = [double]::Parse("$($Obj.LargeFileSizeWarningGB)") 2>$null
+        if ($gb -lt 0) { $Obj.LargeFileSizeWarningGB = $defaults.LargeFileSizeWarningGB } else { $Obj.LargeFileSizeWarningGB = [double]$gb }
+    } catch { $Obj.LargeFileSizeWarningGB = $defaults.LargeFileSizeWarningGB }
 
     return $Obj
 }
@@ -421,8 +427,9 @@ function Select-File {
             Write-Host ("  Modified: {0}" -f $lastModified) -ForegroundColor White
             Write-Host ("  Path: {0}" -f $selectedFile) -ForegroundColor DarkGray
             
-            # Warn for very large files (>1GB)
-            if ($fileInfo.Length -gt 1GB) {
+            # Warn for very large files (configurable threshold)
+            $warningThresholdBytes = [int64]($Global:Settings.LargeFileSizeWarningGB * 1GB)
+            if ($fileInfo.Length -gt $warningThresholdBytes) {
                 Write-Host ""
                 Write-Host ("WARNING: Large file ({0}). Processing may take several minutes." -f $fileSize) -ForegroundColor Yellow
                 $confirm = Read-Host "Continue? (Y/N) [Y]"
@@ -559,7 +566,24 @@ function Get-FileChecksumEx {
 
         } catch {
             Write-LogMessage -Message ("Error computing checksum: {0}" -f $_.Exception.Message) -Level ERROR
-            Throw "Error computing checksum: $($_.Exception.Message)"
+            
+            # Display user-friendly error message
+            Write-Host ""
+            if ($_.Exception.Message -match "being used by another process") {
+                Write-Host "Error: Cannot access file - it is currently open in another program." -ForegroundColor Red
+                Write-Host "       Please close the file and try again." -ForegroundColor Yellow
+            } elseif ($_.Exception.Message -match "Access.*denied") {
+                Write-Host "Error: Access denied - insufficient permissions to read the file." -ForegroundColor Red
+                Write-Host "       Try running PowerShell as Administrator." -ForegroundColor Yellow
+            } elseif ($_.Exception.Message -match "could not find") {
+                Write-Host "Error: File not found or path is invalid." -ForegroundColor Red
+            } else {
+                Write-Host "Error: Failed to compute checksum." -ForegroundColor Red
+                Write-Host "       $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+            Write-Host ""
+            
+            return $null
         } finally {
             if ($fs) { try { $fs.Close(); $fs.Dispose() } catch {} }
             if ($hashAlgo) { $hashAlgo.Dispose() }
@@ -831,7 +855,12 @@ function Test-FileChecksum {
 
     # Compute checksum of target file
     try {
-        $calc = Get-FileChecksumEx -Path $Path -Algorithm $chosenAlgorithm -ShowProgress:$ShowProgress -ErrorAction Stop
+        $calc = Get-FileChecksumEx -Path $Path -Algorithm $chosenAlgorithm -ShowProgress:$ShowProgress
+        
+        if (-not $calc) {
+            Write-LogMessage -Message ("Checksum computation returned null for {0} with algorithm {1}" -f $Path, $chosenAlgorithm) -Level ERROR
+            Throw "Failed to compute checksum - file may be inaccessible"
+        }
     } catch {
         Write-LogMessage -Message ("Checksum computation failed for {0} with algorithm {1}: {2}" -f $Path, $chosenAlgorithm, $_.Exception.Message) -Level ERROR
         Throw "Failed to compute checksum: $($_.Exception.Message)"
@@ -1038,9 +1067,17 @@ while ($true) {
             if (-not $alg) { Write-Host "Cancelled algorithm selection." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
 
             Write-LogMessage -Message ("User requested checksum for {0} using {1}" -f $file, $alg) -Level INFO
-            $res = Get-FileChecksumEx -Path $file -Algorithm $alg -ShowProgress
             
-            $fileSize = Format-FileSize -Bytes $res.Length
+            try {
+                $res = Get-FileChecksumEx -Path $file -Algorithm $alg -ShowProgress
+                
+                if (-not $res) {
+                    # Error already displayed by Get-FileChecksumEx
+                    Read-Host "Press Enter to continue..."
+                    continue
+                }
+                
+                $fileSize = Format-FileSize -Bytes $res.Length
             Write-Host ""
             Write-Host ("File: {0} ({1})" -f (Split-Path -Leaf $file), $fileSize) -ForegroundColor Cyan
             Write-Host ("Checksum ({0}): {1}" -f $res.Algorithm, $res.Checksum) -ForegroundColor Green
@@ -1092,6 +1129,11 @@ while ($true) {
             }
 
             Read-Host "Press Enter to continue..."
+            } catch {
+                Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+                Write-LogMessage -Message ("Checksum calculation failed: {0}" -f $_.Exception.Message) -Level ERROR
+                Read-Host "Press Enter to continue..."
+            }
         }
 
         '2' {
@@ -1126,13 +1168,26 @@ while ($true) {
                 $res = Test-FileChecksum -Path $file -ExpectedChecksumOrFile $inputValue -AutoDetectAlgorithm -ShowProgress
             } catch {
                 Write-Host ""
-                Write-Host "Verification Failed" -ForegroundColor Red
-                Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                # Check if it's a file access error
+                if ($_.Exception.Message -match "being used by another process") {
+                    Write-Host "Error: Cannot access file - it is currently open in another program." -ForegroundColor Red
+                    Write-Host "       Please close the file and try again." -ForegroundColor Yellow
+                } elseif ($_.Exception.Message -match "Access.*denied") {
+                    Write-Host "Error: Access denied - insufficient permissions to read the file." -ForegroundColor Red
+                    Write-Host "       Try running PowerShell as Administrator." -ForegroundColor Yellow
+                } elseif ($_.Exception.Message -match "Failed to compute checksum") {
+                    Write-Host "Error: Failed to compute checksum." -ForegroundColor Red
+                    Write-Host "       $($_.Exception.Message)" -ForegroundColor Yellow
+                } else {
+                    Write-Host "Verification Failed" -ForegroundColor Red
+                    Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                    Write-Host ""
+                    Write-Host "Possible solutions:" -ForegroundColor Cyan
+                    Write-Host "  - Ensure the checksum file is in a supported format" -ForegroundColor White
+                    Write-Host "  - Try specifying the algorithm manually (option 3)" -ForegroundColor White
+                    Write-Host "  - Check that the checksum value is valid hexadecimal" -ForegroundColor White
+                }
                 Write-Host ""
-                Write-Host "Possible solutions:" -ForegroundColor Cyan
-                Write-Host "  - Ensure the checksum file is in a supported format" -ForegroundColor White
-                Write-Host "  - Try specifying the algorithm manually (option 3)" -ForegroundColor White
-                Write-Host "  - Check that the checksum value is valid hexadecimal" -ForegroundColor White
                 Write-LogMessage -Message ("Verification error: {0}" -f $_.Exception.Message) -Level ERROR
                 Read-Host "Press Enter to continue..."
                 continue
@@ -1213,14 +1268,25 @@ while ($true) {
                 $res = Test-FileChecksum -Path $file -ExpectedChecksumOrFile $inputValue -Algorithm $alg -ShowProgress
             } catch {
                 Write-Host ""
-                Write-Host "Verification Failed" -ForegroundColor Red
-                Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                # Check if it's a file access error
+                if ($_.Exception.Message -match "being used by another process") {
+                    Write-Host "Error: Cannot access file - it is currently open in another program." -ForegroundColor Red
+                    Write-Host "       Please close the file and try again." -ForegroundColor Yellow
+                } elseif ($_.Exception.Message -match "Access.*denied") {
+                    Write-Host "Error: Access denied - insufficient permissions to read the file." -ForegroundColor Red
+                    Write-Host "       Try running PowerShell as Administrator." -ForegroundColor Yellow
+                } elseif ($_.Exception.Message -match "Failed to compute checksum") {
+                    Write-Host "Error: Failed to compute checksum." -ForegroundColor Red
+                    Write-Host "       $($_.Exception.Message)" -ForegroundColor Yellow
+                } else {
+                    Write-Host "Verification Failed" -ForegroundColor Red
+                    Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                    Write-Host ""
+                    Write-Host "Possible solutions:" -ForegroundColor Cyan
+                    Write-Host "  - Ensure the checksum is valid hexadecimal" -ForegroundColor White
+                    Write-Host "  - Verify the algorithm matches the checksum" -ForegroundColor White
+                }
                 Write-Host ""
-                Write-Host "Possible solutions:" -ForegroundColor Cyan
-                Write-Host "  - Verify the checksum value matches the selected algorithm length" -ForegroundColor White
-                Write-Host ("    ({0} requires specific checksum length)" -f $alg) -ForegroundColor DarkGray
-                Write-Host "  - Check that the checksum file format is correct" -ForegroundColor White
-                Write-Host "  - Ensure the checksum is valid hexadecimal" -ForegroundColor White
                 Write-LogMessage -Message ("Verification error: {0}" -f $_.Exception.Message) -Level ERROR
                 Read-Host "Press Enter to continue..."
                 continue
@@ -1253,30 +1319,51 @@ while ($true) {
             Write-Host "1) Calculate checksum"
             Write-Host "2) Verify checksum (auto-detect)"
             Write-Host "3) Verify checksum (specify algorithm)"
-            Write-Host "4) Cancel"
+            Write-Host "0) Cancel"
             Write-Host ""
-            $action = Read-Host "Choose action (1-4)"
+            Write-Host "Press ESC to cancel" -ForegroundColor DarkGray
+            Write-Host "Choose action (0-3):"
+            
+            $action = Read-SingleKey
+            try { $action = [string]$action; $action = $action.Trim() } catch {}
+            
+            if ([string]::IsNullOrWhiteSpace($action) -or $action -eq '0' -or $action -eq [char]27 -or $action -match '^\x1B' -or $action -eq '4') {
+                continue
+            }
             
             if ($action -eq '1') {
                 $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm" -Default "SHA256"
                 if (-not $alg) { Write-Host "Cancelled." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
                 
                 Write-LogMessage -Message ("User requested checksum for recent file {0} using {1}" -f $file, $alg) -Level INFO
-                $res = Get-FileChecksumEx -Path $file -Algorithm $alg -ShowProgress
                 
-                $fileSize = Format-FileSize -Bytes $res.Length
-                Write-Host ""
-                Write-Host ("File: {0} ({1})" -f (Split-Path -Leaf $file), $fileSize) -ForegroundColor Cyan
-                Write-Host ("Checksum ({0}): {1}" -f $res.Algorithm, $res.Checksum) -ForegroundColor Green
-                Write-Host ("Time elapsed: {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
-                
-                if ($Global:Settings.AutoCopyToClipboard) {
-                    if (Copy-ToClipboard -Text $res.Checksum) {
-                        Write-Host "Checksum automatically copied to clipboard." -ForegroundColor Yellow
+                try {
+                    $res = Get-FileChecksumEx -Path $file -Algorithm $alg -ShowProgress
+                    
+                    if (-not $res) {
+                        # Error already displayed by Get-FileChecksumEx
+                        Read-Host "Press Enter to continue..."
+                        continue
                     }
+                    
+                    $fileSize = Format-FileSize -Bytes $res.Length
+                    Write-Host ""
+                    Write-Host ("File: {0} ({1})" -f (Split-Path -Leaf $file), $fileSize) -ForegroundColor Cyan
+                    Write-Host ("Checksum ({0}): {1}" -f $res.Algorithm, $res.Checksum) -ForegroundColor Green
+                    Write-Host ("Time elapsed: {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+                    
+                    if ($Global:Settings.AutoCopyToClipboard) {
+                        if (Copy-ToClipboard -Text $res.Checksum) {
+                            Write-Host "Checksum automatically copied to clipboard." -ForegroundColor Yellow
+                        }
+                    }
+                    
+                    Read-Host "Press Enter to continue..."
+                } catch {
+                    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+                    Write-LogMessage -Message ("Checksum calculation failed: {0}" -f $_.Exception.Message) -Level ERROR
+                    Read-Host "Press Enter to continue..."
                 }
-                
-                Read-Host "Press Enter to continue..."
             } elseif ($action -eq '2' -or $action -eq '3') {
                 $alg = $null
                 if ($action -eq '3') {
@@ -1295,12 +1382,29 @@ while ($true) {
                     }
                     
                     if ($res.Match) {
-                        Write-Host "Match!" -ForegroundColor Green
+                        Write-Host ""
+                        Write-Host "[OK] MATCH - Checksum Verified Successfully!" -ForegroundColor Green
+                        Write-Host ("  Algorithm: {0}" -f $res.Algorithm) -ForegroundColor White
+                        Write-Host ("  Checksum:  {0}" -f $res.Calculated) -ForegroundColor DarkGray
                     } else {
-                        Write-Host ("Mismatch! Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
+                        Write-Host ""
+                        Write-Host "[FAIL] MISMATCH - Checksum Does Not Match!" -ForegroundColor Red
+                        Write-Host ("  Expected:   {0}" -f $res.ExpectedChecksum) -ForegroundColor Yellow
+                        Write-Host ("  Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
                     }
                 } catch {
-                    Write-Host "Verification failed: $($_.Exception.Message)" -ForegroundColor Red
+                    Write-Host ""
+                    # Check if it's a file access error
+                    if ($_.Exception.Message -match "being used by another process") {
+                        Write-Host "Error: Cannot access file - it is currently open in another program." -ForegroundColor Red
+                        Write-Host "       Please close the file and try again." -ForegroundColor Yellow
+                    } elseif ($_.Exception.Message -match "Access.*denied") {
+                        Write-Host "Error: Access denied - insufficient permissions to read the file." -ForegroundColor Red
+                        Write-Host "       Try running PowerShell as Administrator." -ForegroundColor Yellow
+                    } else {
+                        Write-Host "Verification failed: $($_.Exception.Message)" -ForegroundColor Red
+                    }
+                    Write-Host ""
                 }
                 
                 Read-Host "Press Enter to continue..."
@@ -1317,13 +1421,15 @@ while ($true) {
                 $prefMinDelta = $Global:Settings.ProgressMinDeltaPercent
                 $prefFileDlg = if ($Global:Settings.UseFileDialog) { 'GUI (File Explorer)' } else { 'CLI (Type/Paste Path)' }
                 $prefLogDir = $Global:Settings.LogDirectory
+                $prefWarningGB = $Global:Settings.LargeFileSizeWarningGB
 
                 Write-Host ("1) AutoCopyToClipboard: {0}" -f $prefAutoCopy)
                 Write-Host ("2) Progress update interval (ms): {0}" -f $prefInterval)
                 Write-Host ("3) Progress minimum delta percent: {0}" -f $prefMinDelta)
                 Write-Host ("4) File selection method: {0}" -f $prefFileDlg)
-                Write-Host ("5) Set log directory (current: {0})" -f $prefLogDir)
-                Write-Host ("6) View recent log entries")
+                Write-Host ("5) Large file warning threshold (GB): {0:N1}" -f $prefWarningGB)
+                Write-Host ("6) Set log directory (current: {0})" -f $prefLogDir)
+                Write-Host ("7) View recent log entries")
                 Write-Host ("0) Back to main menu")
                 Write-Host ""
                 Write-Host "Press ESC to cancel" -ForegroundColor DarkGray
@@ -1331,6 +1437,12 @@ while ($true) {
 
                 $prefKey = Read-SingleKey
                 try { $prefKey = [string]$prefKey; $prefKey = $prefKey.Trim().ToUpper() } catch {}
+                
+                # Check for ESC key
+                if ($prefKey -eq [char]27 -or $prefKey -match '^\x1B') {
+                    $inPrefs = $false
+                    continue
+                }
 
                 switch ($prefKey) {
                     '1' {
@@ -1385,6 +1497,22 @@ while ($true) {
                         Start-Sleep -Milliseconds 700
                     }
                     '5' {
+                        $val = Read-Host ("Enter large file warning threshold in GB (e.g. 1.5) [Current: {0:N1}]" -f $Global:Settings.LargeFileSizeWarningGB)
+                        if ($val) {
+                            try {
+                                $gb = [double]$val
+                                if ($gb -gt 0) {
+                                    $Global:Settings.LargeFileSizeWarningGB = $gb
+                                    if (Save-Settings -Settings $Global:Settings) {
+                                        Write-Host ("Large file warning threshold set to {0:N1} GB" -f $gb) -ForegroundColor Yellow
+                                        Write-LogMessage -Message ("LargeFileSizeWarningGB set to {0:N1}" -f $gb) -Level INFO
+                                    } else { Write-Host "Failed to save settings." -ForegroundColor Red }
+                                } else { Write-Host "Must be > 0. No change." -ForegroundColor Yellow }
+                            } catch { Write-Host "Invalid value; no change." -ForegroundColor Yellow }
+                        } else { Write-Host "No change." -ForegroundColor Yellow }
+                        Start-Sleep -Milliseconds 700
+                    }
+                    '6' {
                         $new = $null
                         if ($Global:Settings.UseFileDialog) {
                             try {
@@ -1416,7 +1544,7 @@ while ($true) {
                         } else { Write-Host "No change." -ForegroundColor Yellow }
                         Start-Sleep -Milliseconds 700
                     }
-                    '6' {
+                    '7' {
                         Show-RecentLogEntries -Count 50
                         Read-Host "Press Enter to continue..."
                     }
