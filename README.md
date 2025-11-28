@@ -4,7 +4,7 @@ Menu-driven PowerShell checksum tool (MD5/SHA1/SHA256/...) with clipboard & ISE 
 ## NOTES
 
 - **Author:** Ruben Draaisma
-- **Version:** 1.3.1
+- **Version:** 1.3.2
 - **Tested on:** Windows 11 24H2
 - **Tested with:** PowerShell ISE, PowerShell 5.1 and PowerShell 7
 

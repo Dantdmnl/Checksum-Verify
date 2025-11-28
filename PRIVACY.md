@@ -1,7 +1,7 @@
 # Privacy Policy & GDPR Compliance
 
-**Checksum-Verify Tool v1.3.0**  
-Last Updated: November 9, 2025
+**Checksum-Verify Tool v1.3.2**  
+Last Updated: November 28, 2025
 
 ## Overview
 
@@ -24,7 +24,8 @@ This tool is designed with privacy in mind and is fully GDPR compliant. All data
 3. **Optional Metadata in Generated Files**
    - Username (only if explicitly enabled in Privacy settings)
    - Timestamp of checksum creation
-   - File path and algorithm used
+   - File path (only filename shown when privacy enabled)
+   - Algorithm used
 
 ### What We DON'T Store
 
@@ -76,10 +77,13 @@ Access via: **Main Menu → 6) Privacy & Data Management**
 1. **Toggle username in file metadata**
    - Default: OFF (privacy protected)
    - When OFF: Files show `[Not recorded - Privacy setting]` instead of username
+   - When OFF: Output filenames exclude username (e.g., `file.SHA256.txt`)
+   - When ON: Output filenames include username (e.g., `file.SHA256.Username.txt`)
 
 2. **Toggle path anonymization in logs**
    - Default: ON (privacy protected)
    - When ON: File paths replaced with `[PATH_REDACTED]` in logs
+   - When ON: Metadata files show only filename, not full path
 
 3. **View all stored data**
    - Transparent access to everything we store
@@ -141,4 +145,5 @@ By using this tool, you acknowledge:
 ---
 
 **Version History:**
+- v1.3.2 (2025-11-28): Fixed privacy leaks - anonymized file paths in metadata and removed username from output filenames when privacy mode enabled
 - v1.3.0 (2025-11-09): Added GDPR compliance features, privacy controls, ESC key support, recent files history, human-readable file sizes, and all approved PowerShell verbs

@@ -33,13 +33,13 @@
 
 .NOTES
     - Author: Ruben Draaisma
-    - Version: 1.3.1
+    - Version: 1.3.2
     - Tested on: Windows 11 24H2
     - Tested with: PowerShell ISE, PowerShell 5.1 and PowerShell 7
 #>
 
 #region Version & helper: settings path
-$ScriptVersion = '1.3.1'
+$ScriptVersion = '1.3.2'
 
 function Get-SettingsFilePath {
     try {
@@ -887,8 +887,8 @@ function Test-FileChecksum {
         if (-not $OutputPath) {
             $dir = Split-Path -Parent $Path
             $base = [IO.Path]::GetFileName($Path)
-            $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
-            $OutputPath = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $chosenAlgorithm, $suffix)
+            $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
+            $OutputPath = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $chosenAlgorithm, $suffix)
         }
         try {
             [System.IO.File]::WriteAllText($OutputPath, $calculatedChecksum, [System.Text.Encoding]::UTF8)
@@ -910,8 +910,14 @@ function Save-ChecksumQuick { param([string] $TargetPath,[string] $Checksum)
 function Save-ChecksumWithMetadata { param([string] $TargetPath,[string] $Checksum,[string] $Algorithm,[string] $FilePath)
     $now = (Get-Date).ToString("u")
     $user = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "[Not recorded - Privacy setting]" }
+    $displayPath = if ($Global:Settings.IncludeUsernameInMetadata) { 
+        $FilePath 
+    } else { 
+        # Privacy mode: only show filename, not full path
+        Split-Path -Leaf $FilePath
+    }
     $content = @"
-File:      $FilePath
+File:      $displayPath
 Algorithm: $Algorithm
 Checksum:  $Checksum
 
@@ -1109,8 +1115,8 @@ while ($true) {
                 }
                 'F' {
                     $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                    $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
-                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $res.Algorithm, $suffix)
+                    $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
+                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
                     if (Save-ChecksumQuick -TargetPath $out -Checksum $res.Checksum) {
                         Write-Host "Quick-saved checksum to: $out" -ForegroundColor Yellow
                         Write-LogMessage -Message ("Quick-saved checksum to {0}" -f $out) -Level INFO
@@ -1118,8 +1124,8 @@ while ($true) {
                 }
                 'M' {
                     $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                    $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
-                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $res.Algorithm, $suffix)
+                    $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
+                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
                     if (Save-ChecksumWithMetadata -TargetPath $out -Checksum $res.Checksum -Algorithm $res.Algorithm -FilePath $res.Path) {
                         Write-Host "Saved checksum with metadata to: $out" -ForegroundColor Yellow
                         Write-LogMessage -Message ("Saved checksum with metadata to {0}" -f $out) -Level INFO
@@ -1217,14 +1223,14 @@ while ($true) {
                     'C' { if (Copy-ToClipboard -Text $res.Calculated) { Write-Host "Copied to clipboard." -ForegroundColor Yellow } else { Write-Host "Copy failed." -ForegroundColor Red } }
                     'F' {
                         $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
-                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $res.Algorithm, $suffix)
+                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
+                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
                         if (Save-ChecksumQuick -TargetPath $out -Checksum $res.Calculated) { Write-Host "Saved: $out" -ForegroundColor Yellow } else { Write-Host "Save failed." -ForegroundColor Red }
                     }
                     'M' {
                         $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "checksum" }
-                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}.{2}.txt" -f $base, $res.Algorithm, $suffix)
+                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
+                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
                         if (Save-ChecksumWithMetadata -TargetPath $out -Checksum $res.Calculated -Algorithm $res.Algorithm -FilePath $res.Path) { Write-Host "Saved: $out" -ForegroundColor Yellow } else { Write-Host "Save failed." -ForegroundColor Red }
                     }
                     default { Write-Host "Not saved." -ForegroundColor DarkGray }
