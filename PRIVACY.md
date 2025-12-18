@@ -1,7 +1,7 @@
 # Privacy Policy & GDPR Compliance
 
-**Checksum-Verify Tool v1.3.2**  
-Last Updated: November 28, 2025
+**Checksum-Verify Tool v1.4.0**  
+Last Updated: December 18, 2025
 
 ## Overview
 
@@ -145,5 +145,6 @@ By using this tool, you acknowledge:
 ---
 
 **Version History:**
+- v1.4.0 (2025-12-18): Added auto-discovery of checksum files, enhanced filename matching (exact match prevents .iso vs .iso.xz confusion), cross-platform path support, UTF-8 encoding for checksum files, improved error messages, and elapsed time display in verification results
 - v1.3.2 (2025-11-28): Fixed privacy leaks - anonymized file paths in metadata and removed username from output filenames when privacy mode enabled
 - v1.3.0 (2025-11-09): Added GDPR compliance features, privacy controls, ESC key support, recent files history, human-readable file sizes, and all approved PowerShell verbs

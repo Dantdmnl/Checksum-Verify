@@ -16,10 +16,10 @@
 
 .EXAMPLE
     .\test_syntax.ps1
-    Runs all validation checks on the Share_Manager.ps1 script
+    Runs all validation checks on the Checksum-Verify.ps1 script
 
 .EXAMPLE
-    .\test_syntax.ps1 -ScriptPath "C:\Scripts\Share_Manager.ps1"
+    .\test_syntax.ps1 -ScriptPath "C:\Scripts\Checksum-Verify.ps1"
     Runs validation on a specific script location
 #>
 
@@ -33,7 +33,7 @@ $ScriptPath = Resolve-Path $ScriptPath -ErrorAction Stop
 $SettingsPath = Resolve-Path $SettingsPath -ErrorAction SilentlyContinue
 
 Write-Host "`n================================================================" -ForegroundColor Cyan
-Write-Host "  SHARE MANAGER - SYNTAX & QUALITY VALIDATION" -ForegroundColor Cyan
+Write-Host "  CHECKSUM-VERIFY - SYNTAX & QUALITY VALIDATION" -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host "  Script: $ScriptPath`n" -ForegroundColor Gray
 

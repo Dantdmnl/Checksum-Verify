@@ -4,7 +4,7 @@ Menu-driven PowerShell checksum tool (MD5/SHA1/SHA256/...) with clipboard & ISE 
 ## NOTES
 
 - **Author:** Ruben Draaisma
-- **Version:** 1.3.2
+- **Version:** 1.4.0
 - **Tested on:** Windows 11 24H2
 - **Tested with:** PowerShell ISE, PowerShell 5.1 and PowerShell 7
 
@@ -31,7 +31,11 @@ The tool is designed to be used interactively (menu-driven) but also exposes fun
 - **Clipboard Support**: Auto-copy calculated checksums with `Set-Clipboard` or Windows Forms fallback
 - **File Operations**: Quick-save and save-with-metadata options
 - **Algorithm Detection**: Automatic algorithm detection when verifying checksums
-- **Checksum File Support**: Parse various common checksum file formats
+- **Checksum File Support**: Parse various common checksum file formats (BSD-style, Unix sha*sum, etc.)
+- **Auto-Discovery**: Automatically finds and offers checksum files in the target file's directory
+- **Cross-Platform Paths**: Handles both `/` and `\` path separators in checksum files
+- **Enhanced Filename Matching**: Exact filename matching prevents `.iso` vs `.iso.xz` confusion
+- **UTF-8 Support**: Reads checksum files with UTF-8 encoding and BOM detection
 - **GDPR Compliant**: Privacy-first defaults with full data management controls
 - **Logging**: Rotating logs with optional path anonymization
 - **PowerShell Best Practices**: All approved verbs, parameter validation, comprehensive error handling
@@ -69,6 +73,12 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
    - `6` Privacy & Data Management
    - `7` Exit
 3. Follow prompts and dialogs for file selection and actions.
+
+**Auto-Discovery Feature**: When verifying checksums (options 2 or 3), the tool automatically scans the file's directory for common checksum files and presents them as numbered options. Simply press Enter to use the first discovered file, or select from the list. Supports:
+- File-specific checksums: `yourfile.iso.sha512`, `yourfile.md5`
+- Common names: `SHA256SUMS`, `SHA512SUMS`, `CHECKSUM`, `checksums.txt`
+- BSD-style: `CHECKSUM.SHA512-FreeBSD-15.0-RELEASE-amd64`
+- Wildcard patterns: `*.sha256`, `*.sha512`, `*.md5`
 
 ### Example: programmatic usage
 

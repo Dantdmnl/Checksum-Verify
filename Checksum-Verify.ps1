@@ -18,6 +18,8 @@
     - View recent log entries from preferences
     - Log file for troubleshooting
     - Support for checksum files in various common formats
+    - Auto-discovery of checksum files in target file directory
+    - Cross-platform path handling for checksum files
     - All functions use approved PowerShell verbs
     - GDPR compliant with privacy controls
 
@@ -33,13 +35,13 @@
 
 .NOTES
     - Author: Ruben Draaisma
-    - Version: 1.3.2
+    - Version: 1.4.0
     - Tested on: Windows 11 24H2
     - Tested with: PowerShell ISE, PowerShell 5.1 and PowerShell 7
 #>
 
 #region Version & helper: settings path
-$ScriptVersion = '1.3.2'
+$ScriptVersion = '1.4.0'
 
 function Get-SettingsFilePath {
     try {
@@ -628,6 +630,117 @@ function ConvertTo-NormalizedChecksum {
     return $null
 }
 
+function Find-ChecksumFiles {
+    param(
+        [Parameter(Mandatory=$true)][string] $TargetFilePath
+    )
+
+    if (-not (Test-Path -LiteralPath $TargetFilePath -PathType Leaf)) { return @() }
+
+    $targetDir = Split-Path -Parent $TargetFilePath
+    $targetName = Split-Path -Leaf $TargetFilePath
+    $targetBase = [IO.Path]::GetFileNameWithoutExtension($targetName)
+
+    $foundFiles = @()
+    
+    # Strategy 1: Check specific patterns first
+    $patterns = @(
+        # Exact file-specific checksums
+        "$targetName.md5", "$targetName.sha1", "$targetName.sha256", "$targetName.sha384", "$targetName.sha512",
+        "$targetBase.md5", "$targetBase.sha1", "$targetBase.sha256", "$targetBase.sha384", "$targetBase.sha512",
+        # Common multi-file checksum files
+        "SHA256SUMS", "SHA512SUMS", "SHA1SUMS", "MD5SUMS",
+        "CHECKSUM", "CHECKSUMS", "checksum.txt", "checksums.txt", "checksum", "checksums",
+        "SHA256SUMS.txt", "SHA512SUMS.txt", "SHA1SUMS.txt", "MD5SUMS.txt"
+    )
+
+    foreach ($pattern in $patterns) {
+        try {
+            $searchPath = Join-Path -Path $targetDir -ChildPath $pattern
+            $matchedFiles = Get-ChildItem -Path $searchPath -File -ErrorAction SilentlyContinue
+            foreach ($matchedFile in $matchedFiles) {
+                if ($matchedFile.FullName -ne $TargetFilePath) {
+                    try {
+                        $sample = Get-Content -LiteralPath $matchedFile.FullName -First 10 -ErrorAction SilentlyContinue
+                        if ($sample) {
+                            $hasHex = $sample | Where-Object { $_ -match '[0-9A-Fa-f]{32,128}' }
+                            if ($hasHex) {
+                                Write-Verbose ("Found checksum file: {0}" -f $matchedFile.Name)
+                                $foundFiles += [PSCustomObject]@{
+                                    Path = $matchedFile.FullName
+                                    Name = $matchedFile.Name
+                                    Size = $matchedFile.Length
+                                    Algorithm = Get-AlgorithmFromFilename -Filename $matchedFile.Name
+                                }
+                            }
+                        }
+                    } catch { }
+                }
+            }
+        } catch { }
+    }
+
+    # Strategy 2: Scan directory for files matching common patterns (for files like CHECKSUM.SHA512-FreeBSD-...)
+    try {
+        $allFiles = Get-ChildItem -Path $targetDir -File -ErrorAction SilentlyContinue | 
+            Where-Object { 
+                $_.FullName -ne $TargetFilePath -and
+                ($_.Name -match '(?i)^(checksum|checksums|sha\d+|md5)' -or
+                 $_.Name -match '(?i)\.(sha1|sha256|sha384|sha512|md5|checksum)($|\.)' -or
+                 $_.Name -match '(?i)sums$')
+            }
+        
+        foreach ($file in $allFiles) {
+            # Skip if already found
+            if ($foundFiles | Where-Object { $_.Path -eq $file.FullName }) { continue }
+            
+            try {
+                $sample = Get-Content -LiteralPath $file.FullName -First 10 -ErrorAction SilentlyContinue
+                if ($sample) {
+                    $hasHex = $sample | Where-Object { $_ -match '[0-9A-Fa-f]{32,128}' }
+                    if ($hasHex) {
+                        Write-Verbose ("Found checksum file via directory scan: {0}" -f $file.Name)
+                        $foundFiles += [PSCustomObject]@{
+                            Path = $file.FullName
+                            Name = $file.Name
+                            Size = $file.Length
+                            Algorithm = Get-AlgorithmFromFilename -Filename $file.Name
+                        }
+                    }
+                }
+            } catch { }
+        }
+    } catch { }
+
+    # Return unique files (in case patterns overlap)
+    # Force result to be an array even if only one item
+    $uniqueFiles = @($foundFiles | Sort-Object -Property Path -Unique)
+    $result = @($uniqueFiles | Select-Object -First 5)
+    return ,@($result)
+}
+
+function Get-AlgorithmFromFilename {
+    param([Parameter(Mandatory=$true)][string] $Filename)
+
+    $lower = $Filename.ToLower()
+
+    # Check file extension first
+    if ($lower -match '\.sha512$|sha512sums') { return 'SHA512' }
+    if ($lower -match '\.sha384$') { return 'SHA384' }
+    if ($lower -match '\.sha256$|sha256sums') { return 'SHA256' }
+    if ($lower -match '\.sha1$|sha1sums') { return 'SHA1' }
+    if ($lower -match '\.md5$|md5sums') { return 'MD5' }
+
+    # Check filename contains algorithm name
+    if ($lower -match 'sha512') { return 'SHA512' }
+    if ($lower -match 'sha384') { return 'SHA384' }
+    if ($lower -match 'sha256') { return 'SHA256' }
+    if ($lower -match 'sha1') { return 'SHA1' }
+    if ($lower -match 'md5') { return 'MD5' }
+
+    return $null
+}
+
 function Get-ChecksumFromFile {
     param(
         [Parameter(Mandatory=$true)][string] $Path,
@@ -637,14 +750,20 @@ function Get-ChecksumFromFile {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Throw "Checksum file not found: $Path" }
 
     try {
-        $lines = Get-Content -LiteralPath $Path -ErrorAction Stop
+        # Attempt to read with UTF-8 encoding (most common for checksum files)
+        # This handles BOM and non-ASCII characters properly
+        $lines = Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop
+        if (-not $lines -or $lines.Count -eq 0) {
+            # Fallback: try default encoding if UTF-8 produces no lines
+            $lines = Get-Content -LiteralPath $Path -ErrorAction Stop
+        }
     } catch {
         Throw "Unable to read checksum file: $($_.Exception.Message)"
     }
 
     $candidates = @()
     $lineNum = 0
-    $target = if ($TargetFilename) { [regex]::Escape($TargetFilename) } else { $null }
+    $targetPattern = if ($TargetFilename) { '\b' + [regex]::Escape($TargetFilename) + '\b' } else { $null }
 
     foreach ($raw in $lines) {
         $lineNum++
@@ -666,7 +785,20 @@ function Get-ChecksumFromFile {
                 'MD5'   { $alg = 'MD5' }
             }
             $fileMention = $false
-            if ($target -and ($line -match $target)) { $fileMention = $true }
+            # Extract filename from parentheses if present: "SHA512 (filename) = hash"
+            # Match the last set of parentheses before the equals/colon sign
+            if ($TargetFilename -and $line -match '\(([^)]+)\)\s*(?:=|:)') {
+                $extractedName = $matches[1].Trim()
+                # Normalize path separators for comparison (/ vs \)
+                $normalizedExtracted = $extractedName -replace '[\\/]', [IO.Path]::DirectorySeparatorChar
+                $normalizedTarget = $TargetFilename -replace '[\\/]', [IO.Path]::DirectorySeparatorChar
+                # Try exact match, then basename match (in case checksum file has path)
+                if ($normalizedExtracted -eq $normalizedTarget -or (Split-Path -Leaf $normalizedExtracted) -eq $normalizedTarget) {
+                    $fileMention = $true
+                }
+            } elseif ($targetPattern -and ($line -match $targetPattern)) {
+                $fileMention = $true
+            }
             $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $true }
             continue
         }
@@ -677,7 +809,15 @@ function Get-ChecksumFromFile {
             $fname = $matches['fname'].Trim("`"", "'")
             $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
             $fileMention = $false
-            if ($target -and ($fname -match $target -or $line -match $target)) { $fileMention = $true }
+            # For extracted filename, check exact match with path normalization
+            if ($TargetFilename) {
+                $normalizedFname = $fname -replace '[\\/]', [IO.Path]::DirectorySeparatorChar
+                $normalizedTarget = $TargetFilename -replace '[\\/]', [IO.Path]::DirectorySeparatorChar
+                # Match exact, or basename (file only), or target pattern
+                if ($normalizedFname -eq $normalizedTarget -or (Split-Path -Leaf $normalizedFname) -eq $normalizedTarget -or ($targetPattern -and $line -match $targetPattern)) {
+                    $fileMention = $true
+                }
+            }
             $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $fileMention }
             continue
         }
@@ -686,7 +826,7 @@ function Get-ChecksumFromFile {
         if ($line -match '(?i)^\s*Checksum\s*[:=]\s*(?<hex>[0-9A-Fa-f]{32,128})\b') {
             $hex = $matches['hex'].ToLower()
             $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
-            $fileMention = ($target -and ($line -match $target))
+            $fileMention = ($targetPattern -and ($line -match $targetPattern))
             $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $true }
             continue
         }
@@ -712,7 +852,7 @@ function Get-ChecksumFromFile {
                 $hex = $hm.ToLower()
                 $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
                 $fileMention = $false
-                if ($target -and ($line -match $target)) { $fileMention = $true }
+                if ($targetPattern -and ($line -match $targetPattern)) { $fileMention = $true }
                 # prefer lines that also contain the word 'checksum' or an algorithm name
                 $preferred = ($line -match '(?i)checksum') -or ($line -match '(?i)\b(md5|sha1|sha256|sha384|sha512)\b')
                 $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $preferred }
@@ -737,6 +877,15 @@ function Get-ChecksumFromFile {
     $best = $scored | Sort-Object -Property @{Expression='Score';Descending=$true},@{Expression={'$_.Candidate.LineNumber'};Descending=$false} | Select-Object -First 1
 
     if ($best -and $best.Candidate.Checksum) {
+        # Check for ambiguous matches (multiple filename matches with same score)
+        if ($TargetFilename) {
+            $filenameMatches = $candidates | Where-Object { $_.FilenameMatch -and $_.Checksum }
+            if ($filenameMatches.Count -gt 1) {
+                Write-LogMessage -Message ("Multiple matches found for '{0}' in checksum file. Using line {1}" -f $TargetFilename, $best.Candidate.LineNumber) -Level WARN
+                Write-Verbose ("WARNING: Found {0} potential matches for '{1}'. Selected line {2}" -f $filenameMatches.Count, $TargetFilename, $best.Candidate.LineNumber)
+            }
+        }
+        Write-LogMessage -Message ("Selected checksum from line {0}: {1}" -f $best.Candidate.LineNumber, $best.Candidate.Line) -Level DEBUG
         # ensure Algorithm is set if possible
         if (-not $best.Candidate.Algorithm) { $best.Candidate.Algorithm = Get-ChecksumAlgorithmFromLength -Checksum $best.Candidate.Checksum }
         return $best.Candidate
@@ -799,7 +948,10 @@ function Test-FileChecksum {
             Throw "Could not parse checksum file: $ExpectedChecksumOrFile"
         }
 
-        if (-not $parsed) { Throw "Could not extract a checksum candidate from checksum file: $ExpectedChecksumOrFile" }
+        if (-not $parsed) {
+            Write-LogMessage -Message ("No valid checksum found for '{0}' in file: {1}" -f (Split-Path -Leaf $Path), $ExpectedChecksumOrFile) -Level ERROR
+            Throw "Could not find a checksum for '$(Split-Path -Leaf $Path)' in the checksum file. Ensure the filename matches exactly and the file format is supported (BSD-style or Unix sha*sum format)."
+        }
         if (-not $parsed.Checksum) {
             # If parser only returned algorithm hint, keep algorithm hint and let algorithm detection handle it
             $derivedAlgorithm = $parsed.Algorithm
@@ -811,7 +963,10 @@ function Test-FileChecksum {
     } else {
         # Pasted value or user-typed value: normalize and treat as checksum
         $norm = ConvertTo-NormalizedChecksum -Raw $ExpectedChecksumOrFile
-        if (-not $norm) { Throw "Provided checksum string does not contain a valid hex checksum." }
+        if (-not $norm) {
+            Write-LogMessage -Message ("Invalid checksum format provided: {0}" -f $ExpectedChecksumOrFile.Substring(0, [Math]::Min(50, $ExpectedChecksumOrFile.Length))) -Level ERROR
+            Throw "Provided checksum string does not contain a valid hexadecimal checksum. Expected format: 32 (MD5), 40 (SHA1), 64 (SHA256), 96 (SHA384), or 128 (SHA512) hex characters."
+        }
         $expectedChecksum = $norm
     }
 
@@ -1149,7 +1304,54 @@ while ($true) {
 
             Add-RecentFile -FilePath $file
 
-            if ($Global:Settings.UseFileDialog) {
+            Write-Host ""
+            Write-Host "Searching for checksum files in directory..." -ForegroundColor DarkGray
+
+            # Auto-discover checksum files
+            $discoveredFiles = @(Find-ChecksumFiles -TargetFilePath $file)
+            $inputValue = $null
+
+            if ($discoveredFiles -and $discoveredFiles.Count -gt 0) {
+                Write-Host ""
+                Write-Host "Found checksum file(s) in the same directory:" -ForegroundColor Cyan
+                for ($i = 0; $i -lt $discoveredFiles.Count; $i++) {
+                    $df = $discoveredFiles[$i]
+                    $algHint = if ($df.Algorithm) { " ({0})" -f $df.Algorithm } else { "" }
+                    Write-Host ("  [{0}] {1}{2}" -f ($i+1), $df.Name, $algHint) -ForegroundColor White
+                }
+                Write-Host ""
+                Write-Host "Options: 1-$($discoveredFiles.Count)=Use file, P=Paste checksum, F=File picker, [Enter]=Use #1" -ForegroundColor DarkGray
+                $autoChoice = Read-Host "Your choice"
+                
+                if ([string]::IsNullOrWhiteSpace($autoChoice)) {
+                    # Default to first discovered file
+                    $inputValue = $discoveredFiles[0].Path
+                    Write-Host ("Using: {0}" -f $discoveredFiles[0].Name) -ForegroundColor Green
+                } elseif ($autoChoice -match '^[0-9]+$') {
+                    $idx = [int]$autoChoice - 1
+                    if ($idx -ge 0 -and $idx -lt $discoveredFiles.Count) {
+                        $inputValue = $discoveredFiles[$idx].Path
+                        Write-Host ("Using: {0}" -f $discoveredFiles[$idx].Name) -ForegroundColor Green
+                    } else {
+                        Write-Host "Invalid selection." -ForegroundColor Yellow
+                        Start-Sleep -Milliseconds 700
+                        continue
+                    }
+                } elseif ($autoChoice.ToUpper() -eq 'F') {
+                    $chkFile = Select-File -Prompt "Select checksum file to parse"
+                    if (-not $chkFile) { Write-Host "No checksum file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+                    $inputValue = $chkFile
+                } elseif ($autoChoice.ToUpper() -eq 'P') {
+                    $inputValue = Read-Host "Enter expected checksum (paste)"
+                    if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+                } else {
+                    # Treat as pasted checksum
+                    $inputValue = $autoChoice
+                }
+            } elseif ($Global:Settings.UseFileDialog) {
+                # No checksum files found - use traditional prompt
+                Write-Host "No checksum files found in directory." -ForegroundColor DarkGray
+                Write-Host ""
                 # GUI/file-dialog mode: explicit choice between paste or pick checksum file
                 $choice = Read-Host "Provide expected checksum by (P)aste or (F)ile? (P/F) [P]"
                 if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'P' }
@@ -1204,6 +1406,7 @@ while ($true) {
                 Write-Host "[OK] MATCH - Checksum Verified Successfully!" -ForegroundColor Green
                 Write-Host ("  Algorithm: {0}" -f $res.Algorithm) -ForegroundColor White
                 Write-Host ("  Checksum:  {0}" -f $res.Calculated) -ForegroundColor DarkGray
+                Write-Host ("  Time:      {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
                 Write-Host ""
                 if ($Global:Settings.AutoCopyToClipboard) {
                     if (Copy-ToClipboard -Text $res.Calculated) { Write-Host "Checksum copied to clipboard (auto-copy enabled)." -ForegroundColor Yellow } else { Write-Host "Auto-copy failed." -ForegroundColor Red }
@@ -1216,6 +1419,7 @@ while ($true) {
                 Write-Host "[FAIL] MISMATCH - Checksum Does Not Match!" -ForegroundColor Red
                 Write-Host ("  Expected:   {0}" -f $res.ExpectedChecksum) -ForegroundColor Yellow
                 Write-Host ("  Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
+                Write-Host ("  Time:       {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
                 Write-Host ""
                 Write-Host "Actions: (C)opy to Clipboard  (F)ile quick-save  (M)etadata save  (N)one"
                 $save = Read-Host "Choose an action (C/F/M/N) [N]"
@@ -1250,7 +1454,54 @@ while ($true) {
             $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm for verification" -Default "SHA256"
             if (-not $alg) { Write-Host "Cancelled algorithm selection." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
 
-            if ($Global:Settings.UseFileDialog) {
+            Write-Host ""
+            Write-Host "Searching for checksum files in directory..." -ForegroundColor DarkGray
+
+            # Auto-discover checksum files
+            $discoveredFiles = Find-ChecksumFiles -TargetFilePath $file
+            $inputValue = $null
+
+            if ($discoveredFiles -and $discoveredFiles.Count -gt 0) {
+                Write-Host ""
+                Write-Host "Found checksum file(s) in the same directory:" -ForegroundColor Cyan
+                for ($i = 0; $i -lt $discoveredFiles.Count; $i++) {
+                    $df = $discoveredFiles[$i]
+                    $algHint = if ($df.Algorithm) { " ({0})" -f $df.Algorithm } else { "" }
+                    Write-Host ("  [{0}] {1}{2}" -f ($i+1), $df.Name, $algHint) -ForegroundColor White
+                }
+                Write-Host ""
+                Write-Host "Options: 1-$($discoveredFiles.Count)=Use file, P=Paste checksum, F=File picker, [Enter]=Use #1" -ForegroundColor DarkGray
+                $autoChoice = Read-Host "Your choice"
+                
+                if ([string]::IsNullOrWhiteSpace($autoChoice)) {
+                    # Default to first discovered file
+                    $inputValue = $discoveredFiles[0].Path
+                    Write-Host ("Using: {0}" -f $discoveredFiles[0].Name) -ForegroundColor Green
+                } elseif ($autoChoice -match '^[0-9]+$') {
+                    $idx = [int]$autoChoice - 1
+                    if ($idx -ge 0 -and $idx -lt $discoveredFiles.Count) {
+                        $inputValue = $discoveredFiles[$idx].Path
+                        Write-Host ("Using: {0}" -f $discoveredFiles[$idx].Name) -ForegroundColor Green
+                    } else {
+                        Write-Host "Invalid selection." -ForegroundColor Yellow
+                        Start-Sleep -Milliseconds 700
+                        continue
+                    }
+                } elseif ($autoChoice.ToUpper() -eq 'F') {
+                    $chkFile = Select-File -Prompt "Select checksum file to parse"
+                    if (-not $chkFile) { Write-Host "No checksum file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+                    $inputValue = $chkFile
+                } elseif ($autoChoice.ToUpper() -eq 'P') {
+                    $inputValue = Read-Host "Enter expected checksum (paste)"
+                    if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+                } else {
+                    # Treat as pasted checksum
+                    $inputValue = $autoChoice
+                }
+            } elseif ($Global:Settings.UseFileDialog) {
+                # No checksum files found - use traditional prompt
+                Write-Host "No checksum files found in directory." -ForegroundColor DarkGray
+                Write-Host ""
                 $choice = Read-Host "Provide expected checksum by (P)aste or (F)ile? (P/F) [P]"
                 if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'P' }
                 $choice = $choice.Substring(0,1).ToUpper()
@@ -1377,8 +1628,43 @@ while ($true) {
                     if (-not $alg) { Write-Host "Cancelled." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
                 }
                 
-                $inputValue = Read-Host "Enter expected checksum or path to checksum file"
-                if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+                # Auto-discover checksum files
+                $discoveredFiles = Find-ChecksumFiles -TargetFilePath $file
+                $inputValue = $null
+
+                if ($discoveredFiles -and $discoveredFiles.Count -gt 0) {
+                    Write-Host ""
+                    Write-Host "Found checksum file(s) in the same directory:" -ForegroundColor Cyan
+                    for ($i = 0; $i -lt $discoveredFiles.Count; $i++) {
+                        $df = $discoveredFiles[$i]
+                        $algHint = if ($df.Algorithm) { " ({0})" -f $df.Algorithm } else { "" }
+                        Write-Host ("  [{0}] {1}{2}" -f ($i+1), $df.Name, $algHint) -ForegroundColor White
+                    }
+                    Write-Host ""
+                    Write-Host "Options: 1-$($discoveredFiles.Count)=Use file, P=Paste checksum, [Enter]=Use #1" -ForegroundColor DarkGray
+                    $autoChoice = Read-Host "Your choice"
+                    
+                    if ([string]::IsNullOrWhiteSpace($autoChoice)) {
+                        $inputValue = $discoveredFiles[0].Path
+                        Write-Host ("Using: {0}" -f $discoveredFiles[0].Name) -ForegroundColor Green
+                    } elseif ($autoChoice -match '^[0-9]+$') {
+                        $idx = [int]$autoChoice - 1
+                        if ($idx -ge 0 -and $idx -lt $discoveredFiles.Count) {
+                            $inputValue = $discoveredFiles[$idx].Path
+                            Write-Host ("Using: {0}" -f $discoveredFiles[$idx].Name) -ForegroundColor Green
+                        } else {
+                            Write-Host "Invalid selection." -ForegroundColor Yellow
+                            Start-Sleep -Milliseconds 700
+                            continue
+                        }
+                    } else {
+                        # Treat as pasted checksum
+                        $inputValue = $autoChoice
+                    }
+                } else {
+                    $inputValue = Read-Host "Enter expected checksum or path to checksum file"
+                    if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
+                }
                 
                 try {
                     if ($alg) {
@@ -1392,11 +1678,13 @@ while ($true) {
                         Write-Host "[OK] MATCH - Checksum Verified Successfully!" -ForegroundColor Green
                         Write-Host ("  Algorithm: {0}" -f $res.Algorithm) -ForegroundColor White
                         Write-Host ("  Checksum:  {0}" -f $res.Calculated) -ForegroundColor DarkGray
+                        Write-Host ("  Time:      {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
                     } else {
                         Write-Host ""
                         Write-Host "[FAIL] MISMATCH - Checksum Does Not Match!" -ForegroundColor Red
                         Write-Host ("  Expected:   {0}" -f $res.ExpectedChecksum) -ForegroundColor Yellow
                         Write-Host ("  Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
+                        Write-Host ("  Time:       {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
                     }
                 } catch {
                     Write-Host ""
