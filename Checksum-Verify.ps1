@@ -713,10 +713,8 @@ function Find-ChecksumFiles {
     } catch { }
 
     # Return unique files (in case patterns overlap)
-    # Force result to be an array even if only one item
-    $uniqueFiles = @($foundFiles | Sort-Object -Property Path -Unique)
-    $result = @($uniqueFiles | Select-Object -First 5)
-    return ,@($result)
+    # Ensure we return a flat array (avoid nesting when a single result exists)
+    return @($foundFiles | Sort-Object -Property Path -Unique | Select-Object -First 5)
 }
 
 function Get-AlgorithmFromFilename {
