@@ -1,7 +1,7 @@
 # Privacy Policy & GDPR Compliance
 
-**Checksum-Verify Tool v1.4.0**  
-Last Updated: December 18, 2025
+**Checksum-Verify Tool v1.5.0**  
+Last Updated: April 5, 2026
 
 ## Overview
 
@@ -68,7 +68,7 @@ By default, the tool is configured for maximum privacy:
 
 - ✅ **Username NOT included** in file metadata
 - ✅ **File paths anonymized** in logs
-- ✅ Recent files stored (can be cleared anytime)
+- ✅ **Recent files (history) tracking Disabled** by default (GDPR compliant)
 
 ### Privacy Controls
 
@@ -145,6 +145,7 @@ By using this tool, you acknowledge:
 ---
 
 **Version History:**
+- v1.5.0 (2026-04-05): Added support for parallel hashing of multiple algorithms, extended parser to recognize pure hex checksum files, intelligent extraction of checksums from block text, and disabled file history by default to comply strictly with GDPR.
 - v1.4.0 (2025-12-18): Added auto-discovery of checksum files, enhanced filename matching (exact match prevents .iso vs .iso.xz confusion), cross-platform path support, UTF-8 encoding for checksum files, improved error messages, and elapsed time display in verification results
 - v1.3.2 (2025-11-28): Fixed privacy leaks - anonymized file paths in metadata and removed username from output filenames when privacy mode enabled
 - v1.3.0 (2025-11-09): Added GDPR compliance features, privacy controls, ESC key support, recent files history, human-readable file sizes, and all approved PowerShell verbs

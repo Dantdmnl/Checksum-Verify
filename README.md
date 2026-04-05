@@ -4,7 +4,7 @@ Menu-driven PowerShell checksum tool (MD5/SHA1/SHA256/...) with clipboard & ISE 
 ## NOTES
 
 - **Author:** Ruben Draaisma
-- **Version:** 1.4.0
+- **Version:** 1.5.0
 - **Tested on:** Windows 11 24H2
 - **Tested with:** PowerShell ISE, PowerShell 5.1 and PowerShell 7
 
@@ -19,11 +19,12 @@ The tool is designed to be used interactively (menu-driven) but also exposes fun
 ## Key Features
 
 - **Checksum Algorithms**: Streaming calculation for large files (MD5, SHA1, SHA256, SHA384, SHA512)
+- **Parallel Multi-Hashing**: Calculate multiple hash algorithms simultaneously over a single disk read (HDD friendly)
 - **Performance**: Throttled `Write-Progress` updates with configurable interval and minimum delta percent
-- **Large File Support**: Int64-safe arithmetic for files over 2GB
+- **Smart Text Extraction**: Paste entire text blocks; the tool filters out the precise checksum needed
 - **Single-Key Navigation**: No Enter required for menu selections (works in console and PowerShell ISE)
 - **Dual File Selection**: Choose between GUI (File Explorer) or CLI (Type/Paste/Drag-Drop) modes
-- **Recent Files**: Quick access to your last 10 processed files
+- **Recent Files**: Quick access to your last processed files (Disabled by default per privacy policy)
 - **Enhanced Progress**: Real-time speed (MB/s), ETA, and progress in window title
 - **File Info Preview**: See file size, modified date, and large file warnings before processing
 - **Human-Readable Sizes**: Automatic formatting (TB, GB, MB, KB)

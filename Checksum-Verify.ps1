@@ -35,13 +35,13 @@
 
 .NOTES
     - Author: Ruben Draaisma
-    - Version: 1.4.0
+    - Version: 1.5.0
     - Tested on: Windows 11 24H2
     - Tested with: PowerShell ISE, PowerShell 5.1 and PowerShell 7
 #>
 
 #region Version & helper: settings path
-$ScriptVersion = '1.4.0'
+$ScriptVersion = '1.5.0'
 
 function Get-SettingsFilePath {
     try {
@@ -63,6 +63,7 @@ function Get-DefaultSettings {
         ProgressMinDeltaPercent   = 0.25
         UseFileDialog             = $true
         LogDirectory              = $defaultLogDir
+        EnableRecentFiles         = $false
         RecentFiles               = @()
         MaxRecentFiles            = 10
         IncludeUsernameInMetadata = $false
@@ -174,6 +175,11 @@ function ConvertTo-NormalizedSettings {
     } catch { $Obj.UseFileDialog = $defaults.UseFileDialog }
 
     try {
+        $b = $Obj.EnableRecentFiles
+        if ($b -is [string]) { $Obj.EnableRecentFiles = $b -match '^(1|true|yes)$' } else { $Obj.EnableRecentFiles = [bool]$b }
+    } catch { $Obj.EnableRecentFiles = $defaults.EnableRecentFiles }
+
+    try {
         if (-not $Obj.LogDirectory) { $Obj.LogDirectory = $defaults.LogDirectory }
         $ld = $Obj.LogDirectory.Trim()
         $Obj.LogDirectory = $ld
@@ -274,6 +280,8 @@ function Copy-ToClipboard {
 function Add-RecentFile {
     param([Parameter(Mandatory=$true)][string] $FilePath)
     
+    if (-not $Global:Settings.EnableRecentFiles) { return }
+
     if (-not $Global:Settings.RecentFiles) {
         $Global:Settings | Add-Member -MemberType NoteProperty -Name RecentFiles -Value @() -Force
     }
@@ -451,8 +459,13 @@ function Select-File {
 
 #region Algorithm selection
 function Select-AlgorithmMenu {
-    param([string] $Prompt = "Select algorithm", [string] $Default = "SHA256")
-    $map = @{ '1'='MD5'; '2'='SHA1'; '3'='SHA256'; '4'='SHA384'; '5'='SHA512' }
+    param([string] $Prompt = "Select algorithm", [string] $Default = "SHA256", [switch] $AllowAll)
+    if ($AllowAll) {
+        $map = @{ '1'='MD5'; '2'='SHA1'; '3'='SHA256'; '4'='SHA384'; '5'='SHA512'; '6'='ALL' }
+    } else {
+        $map = @{ '1'='MD5'; '2'='SHA1'; '3'='SHA256'; '4'='SHA384'; '5'='SHA512' }
+    }
+    
     while ($true) {
         Write-Host ""
         Write-Host ("{0}:" -f $Prompt)
@@ -461,10 +474,13 @@ function Select-AlgorithmMenu {
         Write-Host "  3) SHA-256"
         Write-Host "  4) SHA-384"
         Write-Host "  5) SHA-512"
+        if ($AllowAll) { Write-Host "  6) ALL (Calculate all parallel)" }
         Write-Host "  0) Cancel / Back"
         Write-Host ""
         Write-Host "Press ESC to cancel" -ForegroundColor DarkGray
-        Write-Host ("{0} (0-5) [Default: {1}]:" -f $Prompt, $Default)
+        
+        $optRange = if ($AllowAll) { "0-6" } else { "0-5" }
+        Write-Host ("{0} ({1}) [Default: {2}]:" -f $Prompt, $optRange, $Default)
         
         $choice = Read-SingleKey
         try { $choice = [string]$choice; $choice = $choice.Trim() } catch {}
@@ -482,7 +498,7 @@ function Get-FileChecksumEx {
     [CmdletBinding(DefaultParameterSetName='ByPath')]
     param(
         [Parameter(Mandatory=$true, Position=0)][ValidateNotNullOrEmpty()][string] $Path,
-        [Parameter(Mandatory=$false)][ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512')][string] $Algorithm = 'SHA256',
+        [Parameter(Mandatory=$false)][ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512','ALL')][string[]] $Algorithm = @('SHA256'),
         [Parameter(Mandatory=$false)][ValidateRange(4096, [int]::MaxValue)][int] $BufferSize = (4 * 1MB),
         [Parameter(Mandatory=$false)][switch] $ShowProgress
     )
@@ -493,10 +509,14 @@ function Get-FileChecksumEx {
         $ProgressUpdateIntervalMs = [int]$Global:Settings.ProgressUpdateIntervalMs
         $ProgressMinDeltaPercent   = [double]$Global:Settings.ProgressMinDeltaPercent
         $progressId = 1
+        
+        if ($Algorithm -contains 'ALL') {
+            $Algorithm = @('MD5','SHA1','SHA256','SHA384','SHA512')
+        }
     }
 
     process {
-        $fs = $null; $hashAlgo = $null
+        $fs = $null; $hashAlgos = @{}
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $originalTitle = $null
         
@@ -504,8 +524,11 @@ function Get-FileChecksumEx {
             # Save original window title
             try { $originalTitle = $Host.UI.RawUI.WindowTitle } catch { }
             
-            $hashAlgo = [System.Security.Cryptography.HashAlgorithm]::Create($Algorithm)
-            if (-not $hashAlgo) { Throw "Unable to create hash algorithm '$Algorithm'." }
+            foreach ($alg in $Algorithm) {
+                $h = [System.Security.Cryptography.HashAlgorithm]::Create($alg)
+                if (-not $h) { Throw "Unable to create hash algorithm '$alg'." }
+                $hashAlgos[$alg] = $h
+            }
 
             $fs = [System.IO.File]::OpenRead($Path)
             $length = [int64]$fs.Length
@@ -514,9 +537,13 @@ function Get-FileChecksumEx {
 
             $lastUpdate = [DateTime]::UtcNow.AddMilliseconds(-$ProgressUpdateIntervalMs)
             $lastPercent = -1.0
+            
+            $algNameStr = if ($Algorithm.Count -gt 1) { "Multiple ($($Algorithm.Count))" } else { $Algorithm[0] }
 
             while (($bytesRead = $fs.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                $hashAlgo.TransformBlock($buffer, 0, $bytesRead, $null, 0) | Out-Null
+                foreach ($alg in $Algorithm) {
+                    $hashAlgos[$alg].TransformBlock($buffer, 0, $bytesRead, $null, 0) | Out-Null
+                }
                 $totalRead += [int64]$bytesRead
 
                 if ($ShowProgress) {
@@ -535,13 +562,13 @@ function Get-FileChecksumEx {
                         $totalMB = [math]::Round([double]$length / 1MB, 2)
                         $speedMBps = [math]::Round($speedBytesPerSec / 1MB, 2)
 
-                        Write-Progress -Id $progressId -Activity ("Calculating {0} checksum" -f $Algorithm) `
+                        Write-Progress -Id $progressId -Activity ("Calculating {0} checksum(s)" -f $algNameStr) `
                                        -Status ("{0:N2}% - {1} MB of {2} MB @ {3} MB/s - ETA: {4}s" -f $percent, $remainingMB, $totalMB, $speedMBps, $etaSec) `
                                        -PercentComplete ([math]::Min(100, [math]::Round($percent, 2)))
                         
                         # Update window title with progress
                         try {
-                            $Host.UI.RawUI.WindowTitle = ("{0} - {1:N1}% - {2}" -f $Algorithm, $percent, (Split-Path -Leaf $Path))
+                            $Host.UI.RawUI.WindowTitle = ("{0} - {1:N1}% - {2}" -f $algNameStr, $percent, (Split-Path -Leaf $Path))
                         } catch { }
 
                         $lastUpdate = $now
@@ -550,21 +577,27 @@ function Get-FileChecksumEx {
                 }
             }
 
-            $hashAlgo.TransformFinalBlock($buffer, 0, 0) | Out-Null
-            $checksumBytes = $hashAlgo.Hash
-            $hex = -join ($checksumBytes | ForEach-Object { "{0:x2}" -f $_ })
+            $results = @()
+            foreach ($alg in $Algorithm) {
+                $hashAlgos[$alg].TransformFinalBlock($buffer, 0, 0) | Out-Null
+                $checksumBytes = $hashAlgos[$alg].Hash
+                $hex = -join ($checksumBytes | ForEach-Object { "{0:x2}" -f $_ })
 
-            $sw.Stop()
+                Write-LogMessage -Message ("Checksum calculated for {0} ({1})" -f $Path, $alg) -Level INFO
 
-            Write-LogMessage -Message ("Checksum calculated for {0} ({1})" -f $Path, $Algorithm) -Level INFO
-
-            [PSCustomObject]@{
-                Path      = (Get-Item -LiteralPath $Path).FullName
-                Algorithm = $Algorithm
-                Checksum  = $hex
-                Length    = $length
-                Elapsed   = $sw.Elapsed
+                $results += [PSCustomObject]@{
+                    Path      = (Get-Item -LiteralPath $Path).FullName
+                    Algorithm = $alg
+                    Checksum  = $hex
+                    Length    = $length
+                    Elapsed   = $sw.Elapsed
+                }
             }
+            $sw.Stop()
+            
+            # If a single algorithm was requested, return a single object for backwards compatibility
+            if ($results.Count -eq 1) { return $results[0] }
+            return $results
 
         } catch {
             Write-LogMessage -Message ("Error computing checksum: {0}" -f $_.Exception.Message) -Level ERROR
@@ -588,8 +621,10 @@ function Get-FileChecksumEx {
             return $null
         } finally {
             if ($fs) { try { $fs.Close(); $fs.Dispose() } catch {} }
-            if ($hashAlgo) { $hashAlgo.Dispose() }
-            if ($ShowProgress) { Write-Progress -Id $progressId -Activity ("Calculating {0}" -f $Algorithm) -Completed }
+            if ($hashAlgos) { 
+                foreach ($h in $hashAlgos.Values) { if ($h) { $h.Dispose() } }
+            }
+            if ($ShowProgress) { Write-Progress -Id $progressId -Activity ("Calculating {0}" -f $algNameStr) -Completed }
             
             # Restore original window title
             if ($originalTitle) {
@@ -611,14 +646,42 @@ function Get-ChecksumAlgorithmFromLength { param([string] $Checksum)
 }
 
 function ConvertTo-NormalizedChecksum {
-    param([Parameter(Mandatory=$true)][string] $Raw)
+    param(
+        [Parameter(Mandatory=$true)][string] $Raw,
+        [Parameter(Mandatory=$false)][string] $Algorithm
+    )
     if (-not $Raw) { return $null }
 
     $tmp = $Raw.Trim()
 
-    # Find all contiguous hex runs of lengths between 32 and 128 and pick the longest.
+    # Find all contiguous hex runs of lengths between 32 and 128
     $hexMatches = [regex]::Matches($tmp, '[0-9A-Fa-f]{32,128}') | ForEach-Object { $_.Value }
+    
     if ($hexMatches -and $hexMatches.Count -gt 0) {
+        if ($Algorithm) {
+            $expectedLen = switch ($Algorithm.ToUpper()) {
+                'MD5'    { 32 }
+                'SHA1'   { 40 }
+                'SHA256' { 64 }
+                'SHA384' { 96 }
+                'SHA512' { 128 }
+                default  { 0 }
+            }
+            if ($expectedLen -gt 0) {
+                # Find matching lengths
+                $lenMatches = @($hexMatches | Where-Object { $_.Length -eq $expectedLen })
+                
+                # If there's multiple of the same length, check if one is explicitly prefixed
+                foreach ($hm in $lenMatches) {
+                    $pattern = "(?i)$($Algorithm)\s*:\s*($hm)"
+                    if ($tmp -match $pattern) { return $hm.ToLower() }
+                }
+                
+                if ($lenMatches.Count -gt 0) { return $lenMatches[0].ToLower() }
+            }
+        }
+        
+        # Fallback to picking the longest valid hex run
         $chosen = $hexMatches | Sort-Object { $_.Length } -Descending | Select-Object -First 1
         return $chosen.ToLower()
     }
@@ -648,10 +711,12 @@ function Find-ChecksumFiles {
         # Exact file-specific checksums
         "$targetName.md5", "$targetName.sha1", "$targetName.sha256", "$targetName.sha384", "$targetName.sha512",
         "$targetBase.md5", "$targetBase.sha1", "$targetBase.sha256", "$targetBase.sha384", "$targetBase.sha512",
+        "$targetName.hash", "$targetBase.hash", "$targetName.hashes", "$targetBase.hashes",
         # Common multi-file checksum files
         "SHA256SUMS", "SHA512SUMS", "SHA1SUMS", "MD5SUMS",
         "CHECKSUM", "CHECKSUMS", "checksum.txt", "checksums.txt", "checksum", "checksums",
-        "SHA256SUMS.txt", "SHA512SUMS.txt", "SHA1SUMS.txt", "MD5SUMS.txt"
+        "SHA256SUMS.txt", "SHA512SUMS.txt", "SHA1SUMS.txt", "MD5SUMS.txt",
+        "hash.txt", "hashes.txt"
     )
 
     foreach ($pattern in $patterns) {
@@ -685,8 +750,8 @@ function Find-ChecksumFiles {
         $allFiles = Get-ChildItem -Path $targetDir -File -ErrorAction SilentlyContinue | 
             Where-Object { 
                 $_.FullName -ne $TargetFilePath -and
-                ($_.Name -match '(?i)^(checksum|checksums|sha\d+|md5)' -or
-                 $_.Name -match '(?i)\.(sha1|sha256|sha384|sha512|md5|checksum)($|\.)' -or
+                ($_.Name -match '(?i)^(checksum|checksums|sha\d+|md5|hash)' -or
+                 $_.Name -match '(?i)\.(sha1|sha256|sha384|sha512|md5|checksum|hash)($|\.)' -or
                  $_.Name -match '(?i)sums$')
             }
         
@@ -843,6 +908,14 @@ function Get-ChecksumFromFile {
             continue
         }
 
+        # 4.5) Single hex dump (just a raw checksum without filename, common in .md5 or .sha256 files)
+        if ($line -match '^\s*(?<hex>[0-9A-Fa-f]{32,128})\s*$') {
+            $hex = $matches['hex'].ToLower()
+            $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
+            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $false; Preferred = $true }
+            continue
+        }
+
         # 5) Generic: find any hex runs (32..128) on the line and treat them as potential checksums
         $hexMatches = [regex]::Matches($line, '[0-9A-Fa-f]{32,128}') | ForEach-Object { $_.Value }
         if ($hexMatches -and $hexMatches.Count -gt 0) {
@@ -960,7 +1033,7 @@ function Test-FileChecksum {
         }
     } else {
         # Pasted value or user-typed value: normalize and treat as checksum
-        $norm = ConvertTo-NormalizedChecksum -Raw $ExpectedChecksumOrFile
+        $norm = ConvertTo-NormalizedChecksum -Raw $ExpectedChecksumOrFile -Algorithm $Algorithm
         if (-not $norm) {
             Write-LogMessage -Message ("Invalid checksum format provided: {0}" -f $ExpectedChecksumOrFile.Substring(0, [Math]::Min(50, $ExpectedChecksumOrFile.Length))) -Level ERROR
             Throw "Provided checksum string does not contain a valid hexadecimal checksum. Expected format: 32 (MD5), 40 (SHA1), 64 (SHA256), 96 (SHA384), or 128 (SHA512) hex characters."
@@ -1020,8 +1093,8 @@ function Test-FileChecksum {
     }
 
     # Normalize both for reliable comparison
-    if ($expectedChecksum) { $expectedChecksum = ConvertTo-NormalizedChecksum -Raw $expectedChecksum }
-    $calculatedChecksum = ConvertTo-NormalizedChecksum -Raw $calc.Checksum
+    if ($expectedChecksum) { $expectedChecksum = ConvertTo-NormalizedChecksum -Raw $expectedChecksum -Algorithm $chosenAlgorithm }
+    $calculatedChecksum = ConvertTo-NormalizedChecksum -Raw $calc.Checksum -Algorithm $chosenAlgorithm
 
     $match = $false
     if ($expectedChecksum -and $calculatedChecksum) { $match = ($calculatedChecksum -ieq $expectedChecksum) }
@@ -1124,6 +1197,113 @@ function Show-RecentLogEntries {
 }
 #endregion
 
+#region UI Helper Functions
+function Get-ExpectedChecksumInteractive {
+    param([string]$TargetFile)
+    
+    $discoveredFiles = Find-ChecksumFiles -TargetFilePath $TargetFile
+    $inputValue = $null
+
+    if ($discoveredFiles -and $discoveredFiles.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Found checksum file(s) in the same directory:" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $discoveredFiles.Count; $i++) {
+            $df = $discoveredFiles[$i]
+            $algHint = if ($df.Algorithm) { " ({0})" -f $df.Algorithm } else { "" }
+            Write-Host ("  [{0}] {1}{2}" -f ($i+1), $df.Name, $algHint) -ForegroundColor White
+        }
+        Write-Host ""
+        Write-Host "Options: 1-$($discoveredFiles.Count)=Use file, P=Paste checksum, F=File picker, [Enter]=Use #1" -ForegroundColor DarkGray
+        $autoChoice = Read-Host "Your choice"
+        
+        if ([string]::IsNullOrWhiteSpace($autoChoice)) {
+            $inputValue = $discoveredFiles[0].Path
+            Write-Host ("Using: {0}" -f $discoveredFiles[0].Name) -ForegroundColor Green
+        } elseif ($autoChoice -match '^[0-9]+$') {
+            $idx = [int]$autoChoice - 1
+            if ($idx -ge 0 -and $idx -lt $discoveredFiles.Count) {
+                $inputValue = $discoveredFiles[$idx].Path
+                Write-Host ("Using: {0}" -f $discoveredFiles[$idx].Name) -ForegroundColor Green
+            } else {
+                Write-Host "Invalid selection." -ForegroundColor Yellow
+                return $null
+            }
+        } elseif ($autoChoice.ToUpper() -eq 'F') {
+            $chkFile = Select-File -Prompt "Select checksum file to parse"
+            if (-not $chkFile) { Write-Host "No checksum file selected." -ForegroundColor Yellow; return $null }
+            $inputValue = $chkFile
+        } elseif ($autoChoice.ToUpper() -eq 'P') {
+            $inputValue = Read-Host "Enter expected checksum (paste)"
+            if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; return $null }
+        } else {
+            $inputValue = $autoChoice
+        }
+    } elseif ($Global:Settings.UseFileDialog) {
+        Write-Host "No checksum files found in directory." -ForegroundColor DarkGray
+        Write-Host ""
+        $choice = Read-Host "Provide expected checksum by (P)aste or (F)ile? (P/F) [P]"
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'P' }
+        $choice = $choice.Substring(0,1).ToUpper()
+
+        if ($choice -eq 'F') {
+            $chkFile = Select-File -Prompt "Select checksum file to parse"
+            if (-not $chkFile) { Write-Host "No checksum file selected." -ForegroundColor Yellow; return $null }
+            $inputValue = $chkFile
+        } else {
+            $inputValue = Read-Host "Enter expected checksum (paste) or a checksum file path"
+            if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; return $null }
+        }
+    } else {
+        $inputValue = Read-Host "Enter expected checksum or full path to a checksum file (leave blank to cancel)"
+        if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; return $null }
+    }
+    
+    return $inputValue
+}
+
+function Show-VerifyResult {
+    param($Result, $FilePath)
+    if ($Result.Match) {
+        Write-Host ""
+        Write-Host "[OK] MATCH - Checksum Verified Successfully!" -ForegroundColor Green
+        Write-Host ("  Algorithm: {0}" -f $Result.Algorithm) -ForegroundColor White
+        Write-Host ("  Checksum:  {0}" -f $Result.Calculated) -ForegroundColor DarkGray
+        Write-Host ("  Time:      {0:N2} seconds" -f $Result.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+        Write-Host ""
+        if ($Global:Settings.AutoCopyToClipboard) {
+            if (Copy-ToClipboard -Text $Result.Calculated) { Write-Host "Checksum copied to clipboard (auto-copy enabled)." -ForegroundColor Yellow }
+        } else {
+            $copy = Read-Host "Copy calculated checksum to clipboard? (Y/N) [N]"
+            if ($copy -match '^[yY]') { if (Copy-ToClipboard -Text $Result.Calculated) { Write-Host "Copied." -ForegroundColor Yellow } }
+        }
+    } else {
+        Write-Host ""
+        Write-Host "[FAIL] MISMATCH - Checksum Does Not Match!" -ForegroundColor Red
+        Write-Host ("  Expected:   {0}" -f $Result.ExpectedChecksum) -ForegroundColor Yellow
+        Write-Host ("  Calculated: {0}" -f $Result.Calculated) -ForegroundColor Red
+        Write-Host ("  Time:       {0:N2} seconds" -f $Result.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "Actions: (C)opy to Clipboard  (F)ile quick-save  (M)etadata save  (N)one"
+        $save = Read-Host "Choose an action (C/F/M/N) [N]"
+        switch (($save).ToUpper()) {
+            'C' { if (Copy-ToClipboard -Text $Result.Calculated) { Write-Host "Copied to clipboard." -ForegroundColor Yellow } }
+            'F' {
+                $dir = Split-Path -Parent $FilePath; $base = [IO.Path]::GetFileName($FilePath)
+                $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
+                $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $Result.Algorithm, $suffix)
+                if (Save-ChecksumQuick -TargetPath $out -Checksum $Result.Calculated) { Write-Host "Saved: $out" -ForegroundColor Yellow }
+            }
+            'M' {
+                $dir = Split-Path -Parent $FilePath; $base = [IO.Path]::GetFileName($FilePath)
+                $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
+                $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $Result.Algorithm, $suffix)
+                if (Save-ChecksumWithMetadata -TargetPath $out -Checksum $Result.Calculated -Algorithm $Result.Algorithm -FilePath $Result.Path) { Write-Host "Saved: $out" -ForegroundColor Yellow }
+            }
+        }
+    }
+}
+#endregion
+
 #region Interactive single-key main menu (host-aware, concise)
 function Read-SingleKey {
     param(
@@ -1185,25 +1365,28 @@ function Show-PrivacyMenu {
     $recentCount = if ($Global:Settings.RecentFiles) { $Global:Settings.RecentFiles.Count } else { 0 }
     $includeUsername = if ($Global:Settings.IncludeUsernameInMetadata) { "Yes" } else { "No (Privacy Protected)" }
     $anonymizeLogs = if ($Global:Settings.AnonymizeLogPaths) { "Yes (Privacy Protected)" } else { "No" }
+    $enableHistory = if ($Global:Settings.EnableRecentFiles) { "Yes" } else { "No (Privacy Protected)" }
     
     Write-Host "Current Privacy Settings:" -ForegroundColor Yellow
     Write-Host ("  Include username in file metadata: {0}" -f $includeUsername)
     Write-Host ("  Anonymize file paths in logs: {0}" -f $anonymizeLogs)
-    Write-Host ("  Recent files stored: {0}" -f $recentCount)
+    Write-Host ("  Enable recent files tracking: {0}" -f $enableHistory)
+    Write-Host ("  Recent files currently stored: {0}" -f $recentCount)
     Write-Host ""
     
     Write-Host "Privacy Options:" -ForegroundColor Yellow
     Write-Host "1) Toggle username in file metadata (currently: $includeUsername)"
     Write-Host "2) Toggle path anonymization in logs (currently: $anonymizeLogs)"
-    Write-Host "3) View all stored data"
-    Write-Host "4) Clear recent files history"
-    Write-Host "5) Clear all logs"
-    Write-Host "6) Export all data (JSON)"
-    Write-Host "7) Delete ALL stored data (settings, logs, history)"
+    Write-Host "3) Toggle recent files tracking (currently: $enableHistory)"
+    Write-Host "4) View all stored data"
+    Write-Host "5) Clear recent files history"
+    Write-Host "6) Clear all logs"
+    Write-Host "7) Export all data (JSON)"
+    Write-Host "8) Delete ALL stored data (settings, logs, history)"
     Write-Host "0) Back to main menu"
     Write-Host ""
     Write-Host "Press ESC to cancel" -ForegroundColor DarkGray
-    Write-Host "Choose an option (0-7):"
+    Write-Host "Choose an option (0-8):"
     
     $choice = Read-SingleKey
     try { $choice = [string]$choice; $choice = $choice.Trim() } catch {}
@@ -1222,72 +1405,94 @@ while ($true) {
 
             Add-RecentFile -FilePath $file
 
-            $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm" -Default "SHA256"
+            $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm" -Default "SHA256" -AllowAll
             if (-not $alg) { Write-Host "Cancelled algorithm selection." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
 
             Write-LogMessage -Message ("User requested checksum for {0} using {1}" -f $file, $alg) -Level INFO
             
             try {
-                $res = Get-FileChecksumEx -Path $file -Algorithm $alg -ShowProgress
+                $results = Get-FileChecksumEx -Path $file -Algorithm $alg -ShowProgress
                 
-                if (-not $res) {
+                if (-not $results) {
                     # Error already displayed by Get-FileChecksumEx
                     Read-Host "Press Enter to continue..."
                     continue
                 }
                 
-                $fileSize = Format-FileSize -Bytes $res.Length
-            Write-Host ""
-            Write-Host ("File: {0} ({1})" -f (Split-Path -Leaf $file), $fileSize) -ForegroundColor Cyan
-            Write-Host ("Checksum ({0}): {1}" -f $res.Algorithm, $res.Checksum) -ForegroundColor Green
-            Write-Host ("Time elapsed: {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
-
-            if ($Global:Settings.AutoCopyToClipboard) {
-                if (Copy-ToClipboard -Text $res.Checksum) {
-                    Write-Host "Checksum automatically copied to clipboard (preference enabled)." -ForegroundColor Yellow
-                    Write-LogMessage -Message "Checksum copied to clipboard automatically" -Level INFO
-                } else {
-                    Write-Host "Auto-copy failed (see verbose)." -ForegroundColor Red
-                    Write-LogMessage -Message "Auto-copy failed" -Level WARN
+                # Force into array to handle both single and ALL (multiple) responses nicely
+                $results = @($results)
+                
+                Write-Host ""
+                $fileSize = Format-FileSize -Bytes $results[0].Length
+                Write-Host ("File: {0} ({1})" -f (Split-Path -Leaf $file), $fileSize) -ForegroundColor Cyan
+                
+                foreach ($res in $results) {
+                    Write-Host ("Checksum ({0}): {1}" -f $res.Algorithm, $res.Checksum) -ForegroundColor Green
                 }
-            }
+                
+                Write-Host ("Time elapsed: {0:N2} seconds" -f $results[0].Elapsed.TotalSeconds) -ForegroundColor DarkGray
 
-            Write-Host ""
-            Write-Host "Actions: (C)opy to Clipboard  (F)ile quick-save  (M)etadata save  (N)one"
-            $action = Read-Host "Choose an action (C/F/M/N) [N]"
-
-            switch (($action).ToUpper()) {
-                'C' {
-                    if (Copy-ToClipboard -Text $res.Checksum) {
-                        Write-Host "Checksum copied to clipboard." -ForegroundColor Yellow
-                        Write-LogMessage -Message "Checksum copied to clipboard by user" -Level INFO
+                if ($Global:Settings.AutoCopyToClipboard) {
+                    if ($results.Count -gt 1) {
+                        $copyText = ($results | ForEach-Object { "$($_.Algorithm): $($_.Checksum)" }) -join "`r`n"
                     } else {
-                        Write-Host "Copy to clipboard failed (see verbose)." -ForegroundColor Red
-                        Write-LogMessage -Message "User copy to clipboard failed" -Level WARN
+                        $copyText = $results[0].Checksum
+                    }
+                    if (Copy-ToClipboard -Text $copyText) {
+                        Write-Host "Checksum(s) automatically copied to clipboard (preference enabled)." -ForegroundColor Yellow
+                        Write-LogMessage -Message "Checksum copied to clipboard automatically" -Level INFO
+                    } else {
+                        Write-Host "Auto-copy failed (see verbose)." -ForegroundColor Red
+                        Write-LogMessage -Message "Auto-copy failed" -Level WARN
                     }
                 }
-                'F' {
-                    $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                    $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
-                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
-                    if (Save-ChecksumQuick -TargetPath $out -Checksum $res.Checksum) {
-                        Write-Host "Quick-saved checksum to: $out" -ForegroundColor Yellow
-                        Write-LogMessage -Message ("Quick-saved checksum to {0}" -f $out) -Level INFO
-                    } else { Write-Host "Quick-save failed." -ForegroundColor Red }
-                }
-                'M' {
-                    $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                    $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
-                    $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
-                    if (Save-ChecksumWithMetadata -TargetPath $out -Checksum $res.Checksum -Algorithm $res.Algorithm -FilePath $res.Path) {
-                        Write-Host "Saved checksum with metadata to: $out" -ForegroundColor Yellow
-                        Write-LogMessage -Message ("Saved checksum with metadata to {0}" -f $out) -Level INFO
-                    } else { Write-Host "Save with metadata failed." -ForegroundColor Red }
-                }
-                default { Write-Host "No action taken." -ForegroundColor DarkGray }
-            }
 
-            Read-Host "Press Enter to continue..."
+                # ... (rest of action menu below, skipping it for array changes? wait, actually let's update actions) 
+                Write-Host ""
+                Write-Host "Actions: (C)opy to Clipboard  (F)ile quick-save  (M)etadata save  (N)one"
+                $action = Read-Host "Choose an action (C/F/M/N) [N]"
+
+                switch (($action).ToUpper()) {
+                    'C' {
+                        if ($results.Count -gt 1) {
+                            $copyText = ($results | ForEach-Object { "$($_.Algorithm): $($_.Checksum)" }) -join "`r`n"
+                        } else {
+                            $copyText = $results[0].Checksum
+                        }
+                        if (Copy-ToClipboard -Text $copyText) {
+                            Write-Host "Checksum(s) copied to clipboard." -ForegroundColor Yellow
+                            Write-LogMessage -Message "Checksum copied to clipboard by user" -Level INFO
+                        } else {
+                            Write-Host "Copy to clipboard failed (see verbose)." -ForegroundColor Red
+                            Write-LogMessage -Message "User copy to clipboard failed" -Level WARN
+                        }
+                    }
+                    'F' {
+                        $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
+                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
+                        foreach ($res in $results) {
+                            $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
+                            if (Save-ChecksumQuick -TargetPath $out -Checksum $res.Checksum) {
+                                Write-Host "Quick-saved checksum to: $out" -ForegroundColor Yellow
+                                Write-LogMessage -Message ("Quick-saved checksum to {0}" -f $out) -Level INFO
+                            } else { Write-Host "Quick-save failed for $($res.Algorithm)." -ForegroundColor Red }
+                        }
+                    }
+                    'M' {
+                        $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
+                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
+                        foreach ($res in $results) {
+                            $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
+                            if (Save-ChecksumWithMetadata -TargetPath $out -Checksum $res.Checksum -Algorithm $res.Algorithm -FilePath $res.Path) {
+                                Write-Host "Saved checksum with metadata to: $out" -ForegroundColor Yellow
+                                Write-LogMessage -Message ("Saved checksum with metadata to {0}" -f $out) -Level INFO
+                            } else { Write-Host "Save with metadata failed for $($res.Algorithm)." -ForegroundColor Red }
+                        }
+                    }
+                    default { Write-Host "No action taken." -ForegroundColor DarkGray }
+                }
+
+                Read-Host "Press Enter to continue..."
             } catch {
                 Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
                 Write-LogMessage -Message ("Checksum calculation failed: {0}" -f $_.Exception.Message) -Level ERROR
@@ -1305,138 +1510,24 @@ while ($true) {
             Write-Host ""
             Write-Host "Searching for checksum files in directory..." -ForegroundColor DarkGray
 
-            # Auto-discover checksum files
-            $discoveredFiles = @(Find-ChecksumFiles -TargetFilePath $file)
-            $inputValue = $null
-
-            if ($discoveredFiles -and $discoveredFiles.Count -gt 0) {
-                Write-Host ""
-                Write-Host "Found checksum file(s) in the same directory:" -ForegroundColor Cyan
-                for ($i = 0; $i -lt $discoveredFiles.Count; $i++) {
-                    $df = $discoveredFiles[$i]
-                    $algHint = if ($df.Algorithm) { " ({0})" -f $df.Algorithm } else { "" }
-                    Write-Host ("  [{0}] {1}{2}" -f ($i+1), $df.Name, $algHint) -ForegroundColor White
-                }
-                Write-Host ""
-                Write-Host "Options: 1-$($discoveredFiles.Count)=Use file, P=Paste checksum, F=File picker, [Enter]=Use #1" -ForegroundColor DarkGray
-                $autoChoice = Read-Host "Your choice"
-                
-                if ([string]::IsNullOrWhiteSpace($autoChoice)) {
-                    # Default to first discovered file
-                    $inputValue = $discoveredFiles[0].Path
-                    Write-Host ("Using: {0}" -f $discoveredFiles[0].Name) -ForegroundColor Green
-                } elseif ($autoChoice -match '^[0-9]+$') {
-                    $idx = [int]$autoChoice - 1
-                    if ($idx -ge 0 -and $idx -lt $discoveredFiles.Count) {
-                        $inputValue = $discoveredFiles[$idx].Path
-                        Write-Host ("Using: {0}" -f $discoveredFiles[$idx].Name) -ForegroundColor Green
-                    } else {
-                        Write-Host "Invalid selection." -ForegroundColor Yellow
-                        Start-Sleep -Milliseconds 700
-                        continue
-                    }
-                } elseif ($autoChoice.ToUpper() -eq 'F') {
-                    $chkFile = Select-File -Prompt "Select checksum file to parse"
-                    if (-not $chkFile) { Write-Host "No checksum file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-                    $inputValue = $chkFile
-                } elseif ($autoChoice.ToUpper() -eq 'P') {
-                    $inputValue = Read-Host "Enter expected checksum (paste)"
-                    if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-                } else {
-                    # Treat as pasted checksum
-                    $inputValue = $autoChoice
-                }
-            } elseif ($Global:Settings.UseFileDialog) {
-                # No checksum files found - use traditional prompt
-                Write-Host "No checksum files found in directory." -ForegroundColor DarkGray
-                Write-Host ""
-                # GUI/file-dialog mode: explicit choice between paste or pick checksum file
-                $choice = Read-Host "Provide expected checksum by (P)aste or (F)ile? (P/F) [P]"
-                if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'P' }
-                $choice = $choice.Substring(0,1).ToUpper()
-
-                if ($choice -eq 'F') {
-                    $chkFile = Select-File -Prompt "Select checksum file to parse"
-                    if (-not $chkFile) { Write-Host "No checksum file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-                    $inputValue = $chkFile
-                } else {
-                    $inputValue = Read-Host "Enter expected checksum (paste) or a checksum file path"
-                    if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-                }
-            } else {
-                # CLI mode: single prompt - user may paste checksum OR type a checksum-file path
-                $inputValue = Read-Host "Enter expected checksum or full path to a checksum file (leave blank to cancel)"
-                if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-            }
+            $inputValue = Get-ExpectedChecksumInteractive -TargetFile $file
+            if (-not $inputValue) { Start-Sleep -Milliseconds 700; continue }
 
             Write-LogMessage -Message ("User requested verify (auto-detect) for {0}" -f $file) -Level INFO
             try {
                 $res = Test-FileChecksum -Path $file -ExpectedChecksumOrFile $inputValue -AutoDetectAlgorithm -ShowProgress
+                Show-VerifyResult -Result $res -FilePath $file
             } catch {
                 Write-Host ""
-                # Check if it's a file access error
                 if ($_.Exception.Message -match "being used by another process") {
                     Write-Host "Error: Cannot access file - it is currently open in another program." -ForegroundColor Red
-                    Write-Host "       Please close the file and try again." -ForegroundColor Yellow
                 } elseif ($_.Exception.Message -match "Access.*denied") {
                     Write-Host "Error: Access denied - insufficient permissions to read the file." -ForegroundColor Red
-                    Write-Host "       Try running PowerShell as Administrator." -ForegroundColor Yellow
-                } elseif ($_.Exception.Message -match "Failed to compute checksum") {
-                    Write-Host "Error: Failed to compute checksum." -ForegroundColor Red
-                    Write-Host "       $($_.Exception.Message)" -ForegroundColor Yellow
                 } else {
-                    Write-Host "Verification Failed" -ForegroundColor Red
-                    Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
-                    Write-Host ""
-                    Write-Host "Possible solutions:" -ForegroundColor Cyan
-                    Write-Host "  - Ensure the checksum file is in a supported format" -ForegroundColor White
-                    Write-Host "  - Try specifying the algorithm manually (option 3)" -ForegroundColor White
-                    Write-Host "  - Check that the checksum value is valid hexadecimal" -ForegroundColor White
+                    Write-Host "Verification Failed: $($_.Exception.Message)" -ForegroundColor Red
                 }
                 Write-Host ""
                 Write-LogMessage -Message ("Verification error: {0}" -f $_.Exception.Message) -Level ERROR
-                Read-Host "Press Enter to continue..."
-                continue
-            }
-
-            if ($res.Match) {
-                Write-Host ""
-                Write-Host "[OK] MATCH - Checksum Verified Successfully!" -ForegroundColor Green
-                Write-Host ("  Algorithm: {0}" -f $res.Algorithm) -ForegroundColor White
-                Write-Host ("  Checksum:  {0}" -f $res.Calculated) -ForegroundColor DarkGray
-                Write-Host ("  Time:      {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
-                Write-Host ""
-                if ($Global:Settings.AutoCopyToClipboard) {
-                    if (Copy-ToClipboard -Text $res.Calculated) { Write-Host "Checksum copied to clipboard (auto-copy enabled)." -ForegroundColor Yellow } else { Write-Host "Auto-copy failed." -ForegroundColor Red }
-                } else {
-                    $copy = Read-Host "Copy calculated checksum to clipboard? (Y/N) [N]"
-                    if ($copy -match '^[yY]') { if (Copy-ToClipboard -Text $res.Calculated) { Write-Host "Copied." -ForegroundColor Yellow } else { Write-Host "Copy failed." -ForegroundColor Red } }
-                }
-            } else {
-                Write-Host ""
-                Write-Host "[FAIL] MISMATCH - Checksum Does Not Match!" -ForegroundColor Red
-                Write-Host ("  Expected:   {0}" -f $res.ExpectedChecksum) -ForegroundColor Yellow
-                Write-Host ("  Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
-                Write-Host ("  Time:       {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
-                Write-Host ""
-                Write-Host "Actions: (C)opy to Clipboard  (F)ile quick-save  (M)etadata save  (N)one"
-                $save = Read-Host "Choose an action (C/F/M/N) [N]"
-                switch (($save).ToUpper()) {
-                    'C' { if (Copy-ToClipboard -Text $res.Calculated) { Write-Host "Copied to clipboard." -ForegroundColor Yellow } else { Write-Host "Copy failed." -ForegroundColor Red } }
-                    'F' {
-                        $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
-                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
-                        if (Save-ChecksumQuick -TargetPath $out -Checksum $res.Calculated) { Write-Host "Saved: $out" -ForegroundColor Yellow } else { Write-Host "Save failed." -ForegroundColor Red }
-                    }
-                    'M' {
-                        $dir = Split-Path -Parent $file; $base = [IO.Path]::GetFileName($file)
-                        $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
-                        $out = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $res.Algorithm, $suffix)
-                        if (Save-ChecksumWithMetadata -TargetPath $out -Checksum $res.Calculated -Algorithm $res.Algorithm -FilePath $res.Path) { Write-Host "Saved: $out" -ForegroundColor Yellow } else { Write-Host "Save failed." -ForegroundColor Red }
-                    }
-                    default { Write-Host "Not saved." -ForegroundColor DarkGray }
-                }
             }
 
             Read-Host "Press Enter to continue..."
@@ -1455,108 +1546,24 @@ while ($true) {
             Write-Host ""
             Write-Host "Searching for checksum files in directory..." -ForegroundColor DarkGray
 
-            # Auto-discover checksum files
-            $discoveredFiles = Find-ChecksumFiles -TargetFilePath $file
-            $inputValue = $null
-
-            if ($discoveredFiles -and $discoveredFiles.Count -gt 0) {
-                Write-Host ""
-                Write-Host "Found checksum file(s) in the same directory:" -ForegroundColor Cyan
-                for ($i = 0; $i -lt $discoveredFiles.Count; $i++) {
-                    $df = $discoveredFiles[$i]
-                    $algHint = if ($df.Algorithm) { " ({0})" -f $df.Algorithm } else { "" }
-                    Write-Host ("  [{0}] {1}{2}" -f ($i+1), $df.Name, $algHint) -ForegroundColor White
-                }
-                Write-Host ""
-                Write-Host "Options: 1-$($discoveredFiles.Count)=Use file, P=Paste checksum, F=File picker, [Enter]=Use #1" -ForegroundColor DarkGray
-                $autoChoice = Read-Host "Your choice"
-                
-                if ([string]::IsNullOrWhiteSpace($autoChoice)) {
-                    # Default to first discovered file
-                    $inputValue = $discoveredFiles[0].Path
-                    Write-Host ("Using: {0}" -f $discoveredFiles[0].Name) -ForegroundColor Green
-                } elseif ($autoChoice -match '^[0-9]+$') {
-                    $idx = [int]$autoChoice - 1
-                    if ($idx -ge 0 -and $idx -lt $discoveredFiles.Count) {
-                        $inputValue = $discoveredFiles[$idx].Path
-                        Write-Host ("Using: {0}" -f $discoveredFiles[$idx].Name) -ForegroundColor Green
-                    } else {
-                        Write-Host "Invalid selection." -ForegroundColor Yellow
-                        Start-Sleep -Milliseconds 700
-                        continue
-                    }
-                } elseif ($autoChoice.ToUpper() -eq 'F') {
-                    $chkFile = Select-File -Prompt "Select checksum file to parse"
-                    if (-not $chkFile) { Write-Host "No checksum file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-                    $inputValue = $chkFile
-                } elseif ($autoChoice.ToUpper() -eq 'P') {
-                    $inputValue = Read-Host "Enter expected checksum (paste)"
-                    if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-                } else {
-                    # Treat as pasted checksum
-                    $inputValue = $autoChoice
-                }
-            } elseif ($Global:Settings.UseFileDialog) {
-                # No checksum files found - use traditional prompt
-                Write-Host "No checksum files found in directory." -ForegroundColor DarkGray
-                Write-Host ""
-                $choice = Read-Host "Provide expected checksum by (P)aste or (F)ile? (P/F) [P]"
-                if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'P' }
-                $choice = $choice.Substring(0,1).ToUpper()
-
-                if ($choice -eq 'F') {
-                    $chkFile = Select-File -Prompt "Select checksum file to parse"
-                    if (-not $chkFile) { Write-Host "No checksum file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-                    $inputValue = $chkFile
-                } else {
-                    $inputValue = Read-Host "Enter expected checksum (paste) or a checksum file path"
-                    if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-                }
-            } else {
-                # CLI mode: single prompt (paste checksum or type path)
-                $inputValue = Read-Host "Enter expected checksum or full path to a checksum file (leave blank to cancel)"
-                if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-            }
+            $inputValue = Get-ExpectedChecksumInteractive -TargetFile $file
+            if (-not $inputValue) { Start-Sleep -Milliseconds 700; continue }
 
             Write-LogMessage -Message ("User requested verify (explicit {0}) for {1}" -f $alg, $file) -Level INFO
             try {
                 $res = Test-FileChecksum -Path $file -ExpectedChecksumOrFile $inputValue -Algorithm $alg -ShowProgress
+                Show-VerifyResult -Result $res -FilePath $file
             } catch {
                 Write-Host ""
-                # Check if it's a file access error
                 if ($_.Exception.Message -match "being used by another process") {
                     Write-Host "Error: Cannot access file - it is currently open in another program." -ForegroundColor Red
-                    Write-Host "       Please close the file and try again." -ForegroundColor Yellow
                 } elseif ($_.Exception.Message -match "Access.*denied") {
                     Write-Host "Error: Access denied - insufficient permissions to read the file." -ForegroundColor Red
-                    Write-Host "       Try running PowerShell as Administrator." -ForegroundColor Yellow
-                } elseif ($_.Exception.Message -match "Failed to compute checksum") {
-                    Write-Host "Error: Failed to compute checksum." -ForegroundColor Red
-                    Write-Host "       $($_.Exception.Message)" -ForegroundColor Yellow
                 } else {
-                    Write-Host "Verification Failed" -ForegroundColor Red
-                    Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
-                    Write-Host ""
-                    Write-Host "Possible solutions:" -ForegroundColor Cyan
-                    Write-Host "  - Ensure the checksum is valid hexadecimal" -ForegroundColor White
-                    Write-Host "  - Verify the algorithm matches the checksum" -ForegroundColor White
+                    Write-Host "Verification Failed: $($_.Exception.Message)" -ForegroundColor Red
                 }
                 Write-Host ""
                 Write-LogMessage -Message ("Verification error: {0}" -f $_.Exception.Message) -Level ERROR
-                Read-Host "Press Enter to continue..."
-                continue
-            }
-
-            if ($res.Match) {
-                Write-Host ""
-                Write-Host "[OK] MATCH - Checksum Verified Successfully!" -ForegroundColor Green
-                Write-Host ("  Algorithm: {0}" -f $res.Algorithm) -ForegroundColor White
-                Write-Host ("  Checksum:  {0}" -f $res.Calculated) -ForegroundColor DarkGray
-            } else {
-                Write-Host ""
-                Write-Host "[FAIL] MISMATCH - Checksum Does Not Match!" -ForegroundColor Red
-                Write-Host ("  Expected:  {0}" -f $res.ExpectedChecksum) -ForegroundColor Yellow
-                Write-Host ("  Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
             }
             Read-Host "Press Enter to continue..."
         }
@@ -1596,7 +1603,6 @@ while ($true) {
                     $res = Get-FileChecksumEx -Path $file -Algorithm $alg -ShowProgress
                     
                     if (-not $res) {
-                        # Error already displayed by Get-FileChecksumEx
                         Read-Host "Press Enter to continue..."
                         continue
                     }
@@ -1626,43 +1632,8 @@ while ($true) {
                     if (-not $alg) { Write-Host "Cancelled." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
                 }
                 
-                # Auto-discover checksum files
-                $discoveredFiles = Find-ChecksumFiles -TargetFilePath $file
-                $inputValue = $null
-
-                if ($discoveredFiles -and $discoveredFiles.Count -gt 0) {
-                    Write-Host ""
-                    Write-Host "Found checksum file(s) in the same directory:" -ForegroundColor Cyan
-                    for ($i = 0; $i -lt $discoveredFiles.Count; $i++) {
-                        $df = $discoveredFiles[$i]
-                        $algHint = if ($df.Algorithm) { " ({0})" -f $df.Algorithm } else { "" }
-                        Write-Host ("  [{0}] {1}{2}" -f ($i+1), $df.Name, $algHint) -ForegroundColor White
-                    }
-                    Write-Host ""
-                    Write-Host "Options: 1-$($discoveredFiles.Count)=Use file, P=Paste checksum, [Enter]=Use #1" -ForegroundColor DarkGray
-                    $autoChoice = Read-Host "Your choice"
-                    
-                    if ([string]::IsNullOrWhiteSpace($autoChoice)) {
-                        $inputValue = $discoveredFiles[0].Path
-                        Write-Host ("Using: {0}" -f $discoveredFiles[0].Name) -ForegroundColor Green
-                    } elseif ($autoChoice -match '^[0-9]+$') {
-                        $idx = [int]$autoChoice - 1
-                        if ($idx -ge 0 -and $idx -lt $discoveredFiles.Count) {
-                            $inputValue = $discoveredFiles[$idx].Path
-                            Write-Host ("Using: {0}" -f $discoveredFiles[$idx].Name) -ForegroundColor Green
-                        } else {
-                            Write-Host "Invalid selection." -ForegroundColor Yellow
-                            Start-Sleep -Milliseconds 700
-                            continue
-                        }
-                    } else {
-                        # Treat as pasted checksum
-                        $inputValue = $autoChoice
-                    }
-                } else {
-                    $inputValue = Read-Host "Enter expected checksum or path to checksum file"
-                    if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
-                }
+                $inputValue = Get-ExpectedChecksumInteractive -TargetFile $file
+                if (-not $inputValue) { Start-Sleep -Milliseconds 700; continue }
                 
                 try {
                     if ($alg) {
@@ -1670,29 +1641,13 @@ while ($true) {
                     } else {
                         $res = Test-FileChecksum -Path $file -ExpectedChecksumOrFile $inputValue -AutoDetectAlgorithm -ShowProgress
                     }
-                    
-                    if ($res.Match) {
-                        Write-Host ""
-                        Write-Host "[OK] MATCH - Checksum Verified Successfully!" -ForegroundColor Green
-                        Write-Host ("  Algorithm: {0}" -f $res.Algorithm) -ForegroundColor White
-                        Write-Host ("  Checksum:  {0}" -f $res.Calculated) -ForegroundColor DarkGray
-                        Write-Host ("  Time:      {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
-                    } else {
-                        Write-Host ""
-                        Write-Host "[FAIL] MISMATCH - Checksum Does Not Match!" -ForegroundColor Red
-                        Write-Host ("  Expected:   {0}" -f $res.ExpectedChecksum) -ForegroundColor Yellow
-                        Write-Host ("  Calculated: {0}" -f $res.Calculated) -ForegroundColor Red
-                        Write-Host ("  Time:       {0:N2} seconds" -f $res.Elapsed.TotalSeconds) -ForegroundColor DarkGray
-                    }
+                    Show-VerifyResult -Result $res -FilePath $file
                 } catch {
                     Write-Host ""
-                    # Check if it's a file access error
                     if ($_.Exception.Message -match "being used by another process") {
                         Write-Host "Error: Cannot access file - it is currently open in another program." -ForegroundColor Red
-                        Write-Host "       Please close the file and try again." -ForegroundColor Yellow
                     } elseif ($_.Exception.Message -match "Access.*denied") {
                         Write-Host "Error: Access denied - insufficient permissions to read the file." -ForegroundColor Red
-                        Write-Host "       Try running PowerShell as Administrator." -ForegroundColor Yellow
                     } else {
                         Write-Host "Verification failed: $($_.Exception.Message)" -ForegroundColor Red
                     }
@@ -1875,6 +1830,18 @@ while ($true) {
                         Start-Sleep -Milliseconds 1000
                     }
                     '3' {
+                        $Global:Settings.EnableRecentFiles = -not $Global:Settings.EnableRecentFiles
+                        $state = if ($Global:Settings.EnableRecentFiles) { 'Enabled' } else { 'Disabled (Privacy Protected)' }
+                        if (-not $Global:Settings.EnableRecentFiles) {
+                            $Global:Settings.RecentFiles = @()
+                        }
+                        if (Save-Settings -Settings $Global:Settings) {
+                            Write-Host ("Recent files tracking: {0}" -f $state) -ForegroundColor Yellow
+                            Write-LogMessage -Message ("Privacy: Recent files tracking set to {0}" -f $Global:Settings.EnableRecentFiles) -Level INFO
+                        }
+                        Start-Sleep -Milliseconds 1000
+                    }
+                    '4' {
                         Clear-Host
                         Write-Host "All Stored Data" -ForegroundColor Cyan
                         Write-Host ("=" * 70) -ForegroundColor DarkGray
@@ -1884,7 +1851,7 @@ while ($true) {
                         Write-Host ""
                         Read-Host "Press Enter to continue..."
                     }
-                    '4' {
+                    '5' {
                         $confirm = Read-Host "Clear recent files history? (Y/N) [N]"
                         if ($confirm -match '^[yY]') {
                             $Global:Settings.RecentFiles = @()
@@ -1897,7 +1864,7 @@ while ($true) {
                         }
                         Start-Sleep -Milliseconds 1000
                     }
-                    '5' {
+                    '6' {
                         $confirm = Read-Host "Clear all log files? This cannot be undone. (Y/N) [N]"
                         if ($confirm -match '^[yY]') {
                             try {
@@ -1916,7 +1883,7 @@ while ($true) {
                         }
                         Start-Sleep -Milliseconds 1000
                     }
-                    '6' {
+                    '7' {
                         try {
                             $exportData = @{
                                 ExportDate = (Get-Date).ToString("o")
@@ -1934,7 +1901,7 @@ while ($true) {
                         }
                         Start-Sleep -Milliseconds 1500
                     }
-                    '7' {
+                    '8' {
                         Write-Host ""
                         Write-Host "WARNING: This will permanently delete:" -ForegroundColor Red
                         Write-Host "  - All settings" -ForegroundColor Yellow
