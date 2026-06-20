@@ -4,7 +4,7 @@ Menu-driven PowerShell checksum tool (MD5/SHA1/SHA256/...) with clipboard & ISE 
 ## NOTES
 
 - **Author:** Ruben Draaisma
-- **Version:** 1.5.0
+- **Version:** 1.6.0
 - **Tested on:** Windows 11 24H2
 - **Tested with:** PowerShell ISE, PowerShell 5.1 and PowerShell 7
 
@@ -24,16 +24,17 @@ The tool is designed to be used interactively (menu-driven) but also exposes fun
 - **Smart Text Extraction**: Paste entire text blocks; the tool filters out the precise checksum needed
 - **Single-Key Navigation**: No Enter required for menu selections (works in console and PowerShell ISE)
 - **Dual File Selection**: Choose between GUI (File Explorer) or CLI (Type/Paste/Drag-Drop) modes
-- **Recent Files**: Quick access to your last processed files (Disabled by default per privacy policy)
+- **Recent Files**: Quick access to your last processed files, with disabled/empty states shown clearly (disabled by default per privacy policy)
 - **Enhanced Progress**: Real-time speed (MB/s), ETA, and progress in window title
 - **File Info Preview**: See file size, modified date, and large file warnings before processing
 - **Human-Readable Sizes**: Automatic formatting (TB, GB, MB, KB)
 - **Persistent Settings**: Stored in `%LOCALAPPDATA%\checksum-tool\settings.json`
 - **Clipboard Support**: Auto-copy calculated checksums with `Set-Clipboard` or Windows Forms fallback
+- **Clipboard Checksum Input**: Verify from checksum text already copied to the clipboard
 - **File Operations**: Quick-save and save-with-metadata options
 - **Algorithm Detection**: Automatic algorithm detection when verifying checksums
-- **Checksum File Support**: Parse various common checksum file formats (BSD-style, Unix sha*sum, etc.)
-- **Auto-Discovery**: Automatically finds and offers checksum files in the target file's directory
+- **Checksum File Support**: Parse common GNU/coreutils, BSD/OpenBSD, OpenSSL, PowerShell-style, and labeled checksum formats
+- **Auto-Discovery**: Automatically finds and offers checksum files in the target file's directory, including file-specific `.SHA256.txt` files
 - **Cross-Platform Paths**: Handles both `/` and `\` path separators in checksum files
 - **Enhanced Filename Matching**: Exact filename matching prevents `.iso` vs `.iso.xz` confusion
 - **UTF-8 Support**: Reads checksum files with UTF-8 encoding and BOM detection
@@ -44,7 +45,7 @@ The tool is designed to be used interactively (menu-driven) but also exposes fun
 ## Prerequisites
 
 - Windows 10 or newer operating system.
-- PowerShell 5.1 or PowerShell 7+ recommended.
+- PowerShell 5.1 or PowerShell 7+ recommended. Version 1.6.0 was validated with Windows PowerShell 5.1 and PowerShell 7.
 - Permission to run PowerShell scripts (you may need to set execution policy for the current user):
 
 ```powershell
@@ -76,10 +77,14 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
 3. Follow prompts and dialogs for file selection and actions.
 
 **Auto-Discovery Feature**: When verifying checksums (options 2 or 3), the tool automatically scans the file's directory for common checksum files and presents them as numbered options. Simply press Enter to use the first discovered file, or select from the list. Supports:
-- File-specific checksums: `yourfile.iso.sha512`, `yourfile.md5`
+- File-specific checksums: `yourfile.iso.sha512`, `yourfile.iso.SHA256.txt`, `yourfile.md5`
 - Common names: `SHA256SUMS`, `SHA512SUMS`, `CHECKSUM`, `checksums.txt`
 - BSD-style: `CHECKSUM.SHA512-FreeBSD-15.0-RELEASE-amd64`
-- Wildcard patterns: `*.sha256`, `*.sha512`, `*.md5`
+- GNU/coreutils and OpenSSL-style lines: `<hash>  filename`, `<hash> *filename`, `SHA256(filename)= hash`
+- BSD/OpenBSD-style hex or base64 digest lines
+- Wildcard patterns: `*.sha256`, `*.sha512`, `*.md5`, `*.SHA256.txt`
+
+If no suitable checksum file is selected, the source menu can also read checksum text directly from the clipboard and previews the detected checksum before using it.
 
 ### Example: programmatic usage
 
@@ -90,7 +95,7 @@ You can call the core functions from PowerShell directly:
 Get-FileChecksumEx -Path 'C:\path\to\file.iso' -Algorithm 'SHA256' -ShowProgress
 
 # Verify checksum (auto-detect)
-Test-FileChecksum -Path 'C:\path\to\file.iso' -ExpectedChecksum 'abcdef123...' -AutoDetectAlgorithm -ShowProgress
+Test-FileChecksum -Path 'C:\path\to\file.iso' -ExpectedChecksumOrFile 'abcdef123...' -AutoDetectAlgorithm -ShowProgress
 ```
 
 ## Settings
@@ -101,7 +106,7 @@ Settings are stored (JSON) in:
 %LOCALAPPDATA%\checksum-tool\settings.json
 ```
 
-Default keys: `AutoCopyToClipboard`, `ProgressUpdateIntervalMs`, `ProgressMinDeltaPercent`, `UseFileDialog`, `LogDirectory`, `RecentFiles`, `MaxRecentFiles`, `IncludeUsernameInMetadata`, `AnonymizeLogPaths`.
+Default keys: `AutoCopyToClipboard`, `ProgressUpdateIntervalMs`, `ProgressMinDeltaPercent`, `UseFileDialog`, `LogDirectory`, `RecentFiles`, `MaxRecentFiles`, `IncludeUsernameInMetadata`, `AnonymizeLogPaths`, `LargeFileSizeWarningGB`.
 
 Example JSON:
 
@@ -115,7 +120,8 @@ Example JSON:
     "RecentFiles": [],
     "MaxRecentFiles": 10,
     "IncludeUsernameInMetadata": false,
-    "AnonymizeLogPaths": true
+    "AnonymizeLogPaths": true,
+    "LargeFileSizeWarningGB": 1.0
 }
 ```
 

@@ -43,7 +43,7 @@ $results = @()
 $ast = $null
 
 # Test 1: PowerShell Legacy Parser
-Write-Host "[1/10] PowerShell Legacy Parser Check..." -ForegroundColor Yellow
+Write-Host "[1/11] PowerShell Legacy Parser Check..." -ForegroundColor Yellow
 $errors = $null
 try {
     [System.Management.Automation.PSParser]::Tokenize(
@@ -71,7 +71,7 @@ try {
 }
 
 # Test 2: AST (Abstract Syntax Tree) Parser
-Write-Host "`n[2/10] AST (Abstract Syntax Tree) Parser..." -ForegroundColor Yellow
+Write-Host "`n[2/11] AST (Abstract Syntax Tree) Parser..." -ForegroundColor Yellow
 $parseErrors = $null
 try {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -100,7 +100,7 @@ try {
 }
 
 # Test 3: Function Definition Analysis
-Write-Host "`n[3/10] Function Definition Analysis..." -ForegroundColor Yellow
+Write-Host "`n[3/11] Function Definition Analysis..." -ForegroundColor Yellow
 try {
     if ($ast) {
         $functions = $ast.FindAll({
@@ -140,7 +140,7 @@ try {
 }
 
 # Test 4: Script Complexity & Metrics
-Write-Host "`n[4/10] Script Complexity & Metrics..." -ForegroundColor Yellow
+Write-Host "`n[4/11] Script Complexity & Metrics..." -ForegroundColor Yellow
 try {
     if ($ast) {
         $scriptContent = Get-Content $ScriptPath -Raw
@@ -171,7 +171,7 @@ try {
 }
 
 # Test 5: Security Check - Hardcoded Secrets
-Write-Host "`n[5/10] Security Check - Hardcoded Secrets..." -ForegroundColor Yellow
+Write-Host "`n[5/11] Security Check - Hardcoded Secrets..." -ForegroundColor Yellow
 try {
     $content = Get-Content $ScriptPath -Raw
     $lines = $content -split "`n"
@@ -219,7 +219,7 @@ try {
 }
 
 # Test 6: PSScriptAnalyzer (Code Quality)
-Write-Host "`n[6/10] PSScriptAnalyzer (Code Quality)..." -ForegroundColor Yellow
+Write-Host "`n[6/11] PSScriptAnalyzer (Code Quality)..." -ForegroundColor Yellow
 try {
     # Check if PSScriptAnalyzer is available
     if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
@@ -256,7 +256,7 @@ try {
 }
 
 # Test 7: Documentation Quality
-Write-Host "`n[7/10] Documentation Quality Check..." -ForegroundColor Yellow
+Write-Host "`n[7/11] Documentation Quality Check..." -ForegroundColor Yellow
 try {
     if ($ast) {
         $functions = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
@@ -299,7 +299,7 @@ try {
 }
 
 # Test 8: File Encoding & Size Check
-Write-Host "`n[8/10] File Encoding & Size Check..." -ForegroundColor Yellow
+Write-Host "`n[8/11] File Encoding & Size Check..." -ForegroundColor Yellow
 try {
     $bytes = [System.IO.File]::ReadAllBytes($ScriptPath)
     $encoding = "Unknown"
@@ -335,7 +335,7 @@ try {
 
 
 # Test 9: Unicode Character Check
-Write-Host "`n[9/10] Unicode Character Check (ASCII Compliance)..." -ForegroundColor Yellow
+Write-Host "`n[9/11] Unicode Character Check (ASCII Compliance)..." -ForegroundColor Yellow
 try {
     $content = Get-Content $ScriptPath -Raw
     $unicodeMatches = [regex]::Matches($content, '[^\x00-\x7F]')
@@ -385,7 +385,7 @@ try {
 
 
 # Test 10: Function Call Existence Check
-Write-Host "`n[10/10] Function Call Existence Check..." -ForegroundColor Yellow
+Write-Host "`n[10/11] Function Call Existence Check..." -ForegroundColor Yellow
 try {
     if ($ast) {
         # Get all function definitions
@@ -425,6 +425,136 @@ try {
 } catch {
     Write-Host "      [X] ERROR - $_" -ForegroundColor Red
     $results += @{ Test = "Function Call Existence"; Status = "ERROR"; Details = $_.Exception.Message; Critical = $false }
+}
+
+# Test 11: Checksum Parser Regression Checks
+Write-Host "`n[11/11] Checksum Parser Regression Checks..." -ForegroundColor Yellow
+try {
+    if ($ast) {
+        $neededFunctions = @(
+            'Get-ChecksumAlgorithmFromLength',
+            'ConvertTo-CanonicalChecksumAlgorithm',
+            'Get-ChecksumRegexPattern',
+            'Get-ChecksumBase64RegexPattern',
+            'Test-ChecksumValue',
+            'ConvertTo-HexChecksumFromBase64',
+            'ConvertFrom-GnuEscapedFilename',
+            'Test-ChecksumFilenameMatch',
+            'Test-ChecksumLineReferencesTarget',
+            'ConvertTo-NormalizedChecksum',
+            'Get-AlgorithmFromFilename',
+            'Find-ChecksumFiles',
+            'Get-ChecksumFromFile'
+        )
+
+        $functionDefinitions = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }, $true) | Where-Object {
+            $_.Name -in $neededFunctions
+        } | Sort-Object { $_.Extent.StartLineNumber } | ForEach-Object {
+            $_.Extent.Text
+        }
+
+        $testScript = @"
+function Write-LogMessage { param([string] `$Message, [string] `$Level = 'INFO') }
+$($functionDefinitions -join "`n`n")
+
+`$sha256 = 'a' * 64
+`$sha512 = 'b' * 128
+`$base64Sha256 = [Convert]::ToBase64String([byte[]](0..31))
+`$base64Sha256Hex = -join (([byte[]](0..31)) | ForEach-Object { "{0:x2}" -f `$_ })
+if ((ConvertTo-NormalizedChecksum -Raw ('x' * 65))) { throw 'Accepted an invalid 65-character hex token.' }
+if ((ConvertTo-NormalizedChecksum -Raw ('Checksum: ' + `$sha256) -Algorithm 'SHA512')) { throw 'Accepted SHA256-length checksum for SHA512.' }
+if ((ConvertTo-NormalizedChecksum -Raw ('Checksum: ' + `$sha256) -Algorithm 'SHA256') -ne `$sha256) { throw 'Failed to normalize SHA256 checksum.' }
+if ((ConvertTo-CanonicalChecksumAlgorithm -Algorithm 'SHA2-256') -ne 'SHA256') { throw 'Failed SHA2-256 algorithm normalization.' }
+if ((ConvertTo-CanonicalChecksumAlgorithm -Algorithm 'SHA-512') -ne 'SHA512') { throw 'Failed SHA-512 algorithm normalization.' }
+if ((ConvertTo-HexChecksumFromBase64 -Base64 `$base64Sha256) -ne `$base64Sha256Hex) { throw 'Failed base64 checksum conversion.' }
+if ((ConvertFrom-GnuEscapedFilename -Filename 'dir\\file\nname.iso') -ne "dir\file`nname.iso") { throw 'Failed GNU filename unescaping.' }
+if (-not (Test-ChecksumFilenameMatch -CandidateName 'subdir/package.iso' -TargetFilename 'package.iso')) { throw 'Failed basename filename matching.' }
+if (-not (Test-ChecksumFilenameMatch -CandidateName 'package.iso:' -TargetFilename 'package.iso')) { throw 'Failed punctuation-trimmed filename matching.' }
+if (Test-ChecksumFilenameMatch -CandidateName 'package.iso.xz' -TargetFilename 'package.iso') { throw 'Matched package.iso inside package.iso.xz.' }
+
+`$tmp = [System.IO.Path]::GetTempFileName()
+`$tmpDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ([System.Guid]::NewGuid().ToString('N'))
+try {
+    @(
+        ('{0}  package.iso.xz' -f `$sha512),
+        ('{0}  package.iso' -f `$sha256)
+    ) | Set-Content -LiteralPath `$tmp -Encoding UTF8
+
+    `$parsed = Get-ChecksumFromFile -Path `$tmp -TargetFilename 'package.iso'
+    if (-not `$parsed -or `$parsed.Checksum -ne `$sha256 -or `$parsed.Algorithm -ne 'SHA256') {
+        throw 'Did not select the exact package.iso checksum.'
+    }
+
+    @(
+        ('SHA2-256(package.iso)= {0}' -f `$sha256),
+        ('SHA256 (other.iso) = {0}' -f `$sha512)
+    ) | Set-Content -LiteralPath `$tmp -Encoding UTF8
+    `$parsed = Get-ChecksumFromFile -Path `$tmp -TargetFilename 'package.iso'
+    if (-not `$parsed -or `$parsed.Checksum -ne `$sha256 -or `$parsed.Algorithm -ne 'SHA256') {
+        throw 'Did not parse OpenSSL/tagged SHA2-256 format.'
+    }
+
+    @(
+        ('SHA256 (package.iso) = {0}' -f `$base64Sha256)
+    ) | Set-Content -LiteralPath `$tmp -Encoding UTF8
+    `$parsed = Get-ChecksumFromFile -Path `$tmp -TargetFilename 'package.iso'
+    if (-not `$parsed -or `$parsed.Checksum -ne `$base64Sha256Hex -or `$parsed.Algorithm -ne 'SHA256') {
+        throw 'Did not parse BSD/OpenBSD base64 digest format.'
+    }
+
+    New-Item -ItemType Directory -Path `$tmpDir -Force | Out-Null
+    `$targetPath = Join-Path -Path `$tmpDir -ChildPath 'package.iso'
+    `$checksumPath = Join-Path -Path `$tmpDir -ChildPath 'package.iso.SHA256.txt'
+    `$metadataPath = Join-Path -Path `$tmpDir -ChildPath 'downloaded-checksum.txt'
+    Set-Content -LiteralPath `$targetPath -Value 'target-data' -Encoding UTF8
+    @(
+        'Generated checksum file',
+        'Algorithm: SHA256',
+        ('Checksum: {0}' -f `$sha256)
+    ) | Set-Content -LiteralPath `$checksumPath -Encoding UTF8
+
+    `$discovered = @(Find-ChecksumFiles -TargetFilePath `$targetPath)
+    if (-not (`$discovered | Where-Object { `$_.Name -eq 'package.iso.SHA256.txt' -and `$_.Algorithm -eq 'SHA256' })) {
+        throw 'Did not discover target.iso.SHA256.txt checksum file.'
+    }
+
+    @(
+        'File:      package.iso',
+        'Algorithm: SHA256',
+        ('Checksum:  {0}' -f `$sha256),
+        '',
+        'CreatedBy: [Not recorded - Privacy setting]',
+        'CreatedOn: 2025-12-18 17:36:16Z'
+    ) | Set-Content -LiteralPath `$metadataPath -Encoding UTF8
+
+    `$discovered = @(Find-ChecksumFiles -TargetFilePath `$targetPath)
+    if (-not (`$discovered | Where-Object { `$_.Name -eq 'downloaded-checksum.txt' })) {
+        throw 'Did not discover metadata checksum file that references the target.'
+    }
+    `$parsed = Get-ChecksumFromFile -Path `$metadataPath -TargetFilename 'package.iso'
+    if (-not `$parsed -or -not `$parsed.FilenameMatch -or `$parsed.Algorithm -ne 'SHA256') {
+        throw 'Did not associate metadata File/Algorithm lines with Checksum line.'
+    }
+} finally {
+    if (Test-Path -LiteralPath `$tmp) { Remove-Item -LiteralPath `$tmp -Force }
+    if (Test-Path -LiteralPath `$tmpDir) { Remove-Item -LiteralPath `$tmpDir -Recurse -Force }
+}
+"@
+
+        & ([scriptblock]::Create($testScript))
+        Write-Host "      [OK] Parser regression checks passed" -ForegroundColor Green
+        $results += @{ Test = "Checksum Parser Regression"; Status = "PASSED"; Details = "Strict lengths and filename matching"; Critical = $true }
+    } else {
+        Write-Host "      [!] SKIPPED - AST not available" -ForegroundColor Yellow
+        $results += @{ Test = "Checksum Parser Regression"; Status = "SKIPPED"; Details = "AST parse failed"; Critical = $false }
+    }
+} catch {
+    Write-Host "      [X] FAILED - $($_.Exception.Message)" -ForegroundColor Red
+    $allPassed = $false
+    $criticalFailed = $true
+    $results += @{ Test = "Checksum Parser Regression"; Status = "FAILED"; Details = $_.Exception.Message; Critical = $true }
 }
 
 # Summary
