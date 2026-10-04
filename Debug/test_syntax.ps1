@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Comprehensive syntax and code quality validation for Share_Manager.ps1
+    Syntax, parser regression, and code quality validation for Checksum-Verify.ps1
 
 .DESCRIPTION
     Runs multiple validation checks including PowerShell parser, AST validation,
@@ -432,6 +432,8 @@ Write-Host "`n[11/11] Checksum Parser Regression Checks..." -ForegroundColor Yel
 try {
     if ($ast) {
         $neededFunctions = @(
+            'ConvertFrom-ChecksumText',
+            'Get-ChecksumDigestLength',
             'Get-ChecksumAlgorithmFromLength',
             'ConvertTo-CanonicalChecksumAlgorithm',
             'Get-ChecksumRegexPattern',
@@ -633,7 +635,7 @@ Write-Host ""
 if ($criticalFailed) {
     Write-Host "================================================================" -ForegroundColor Red
     Write-Host "  [X] CRITICAL TESTS FAILED" -ForegroundColor Red
-    Write-Host "  Script has syntax errors and cannot be used!" -ForegroundColor Red
+    Write-Host "  A required syntax or parser regression check failed." -ForegroundColor Red
     Write-Host "================================================================" -ForegroundColor Red
     exit 1
 } elseif (-not $allPassed) {
@@ -645,7 +647,7 @@ if ($criticalFailed) {
 } else {
     Write-Host "================================================================" -ForegroundColor Green
     Write-Host "  [OK] ALL TESTS PASSED" -ForegroundColor Green
-    Write-Host "  Script is ready for production use!" -ForegroundColor Green
+    Write-Host "  Required checks passed. Run test_regression.ps1 for behavioral coverage." -ForegroundColor Green
     Write-Host "================================================================" -ForegroundColor Green
     exit 0
 }

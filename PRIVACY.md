@@ -1,151 +1,85 @@
-# Privacy Policy & GDPR Compliance
+# Privacy & Data Storage
 
-**Checksum-Verify Tool v1.5.0**  
-Last Updated: April 5, 2026
+**Checksum-Verify 1.7.0** | Updated October 4, 2026
 
-## Overview
+## Processing and Networking
 
-This tool is designed with privacy in mind and is fully GDPR compliant. All data is stored locally on your device. **No data is transmitted to external servers or third parties.**
+Checksums are calculated locally. Target file contents, checksum input,
+settings, and recent-file history are not uploaded. BLAKE3 sends file bytes to
+the local `b3sum.exe` process through standard input. Local and UNC access
+follows selected paths; a network share can involve that share's server.
 
-## Data Collection & Storage
+Choosing `U` contacts GitHub for release metadata. Confirming an update
+downloads the script. Confirming BLAKE3 setup contacts GitHub for metadata and
+the executable. Requests disclose ordinary connection information, including IP
+address and User-Agent, to GitHub and its download infrastructure. No startup
+update checks or backend downloads happen automatically.
 
-### What Data We Store
+Download checks validate published hashes and sizes, not the trustworthiness of
+a potentially compromised publisher.
 
-1. **Settings File** (`%LOCALAPPDATA%\checksum-tool\settings.json`)
-   - User preferences (clipboard auto-copy, file dialog preference, etc.)
-   - Recent file paths (optional, can be disabled)
-   - Privacy settings
+## Stored Data
 
-2. **Log Files** (`%LOCALAPPDATA%\checksum-tool\checksum_tool.log`)
-   - Application events and errors
-   - File paths (anonymized by default for privacy)
-   - Timestamps of operations
+| Data            | Location and contents                                                                                                               |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Settings        | `%LOCALAPPDATA%\checksum-tool\settings.json`: preferences, log directory, privacy controls, and optional recent paths               |
+| Logs            | Default: `%LOCALAPPDATA%\checksum-tool\checksum_tool.log`; directory configurable. Events, timestamps, errors, and optionally paths |
+| Recent history  | In settings; disabled by default, maximum ten entries by default when enabled                                                       |
+| Saved checksums | Beside the target when requested: digests, manifest filenames, or metadata                                                          |
+| Privacy export  | Uniquely named Desktop JSON: settings, export timestamp, log-file path, and utility version; not log contents                       |
+| Update backup   | Uniquely named `.bak` beside the script after replacement                                                                           |
+| BLAKE3 backend  | `b3sum.exe` beside the script after automatic setup; manual installation can use `PATH`                                             |
 
-3. **Optional Metadata in Generated Files**
-   - Username (only if explicitly enabled in Privacy settings)
-   - Timestamp of checksum creation
-   - File path (only filename shown when privacy enabled)
-   - Algorithm used
+Metadata includes algorithm, digest, creation time, and file information.
+Username inclusion is off by default. With path anonymization enabled, metadata
+uses the basename instead of the full target path.
 
-### What We DON'T Store
+The utility does not encrypt these files. Windows permissions apply. Filenames,
+paths, and error messages may be sensitive; review logs, exports, and sidecars
+before sharing them.
 
-- File contents
-- Checksum values in persistent storage
-- Any network or remote data
-- Personal information beyond optional username
+## Privacy Menu
 
-## Your Privacy Rights (GDPR)
+Open `6) Privacy & data`:
 
-The tool provides a dedicated **Privacy & Data Management** menu with the following capabilities:
+| Key | Action                                                                           |
+| --- | -------------------------------------------------------------------------------- |
+| `1` | Toggle username in metadata and quick/metadata output filenames                  |
+| `2` | Toggle path anonymization in logs and metadata                                   |
+| `3` | Toggle history tracking; disabling clears saved history                          |
+| `4` | View current settings as JSON                                                    |
+| `5` | Clear recent history after confirmation                                          |
+| `6` | Clear the current log and configured archives after confirmation                 |
+| `7` | Export settings information as JSON                                              |
+| `8` | Delete settings, current logs, and configured archives; type `DELETE` to confirm |
+| `0` | Back                                                                             |
 
-### 1. Right to Access
-- View all stored data in JSON format
-- Export all your data to a file
+Path anonymization is on by default and redacts recognized Windows/UNC paths in
+log messages. It does not guarantee removal of every filename or identifying
+detail in arbitrary error text. It does not redact terminal output, settings,
+enabled history, or privacy exports. The main menu displays the Windows username
+regardless of metadata preferences. Clipboard input is previewed locally before
+use.
 
-### 2. Right to Rectification
-- Modify settings at any time
-- Toggle privacy features on/off
+## Retention and Deletion Limits
 
-### 3. Right to Erasure ("Right to be Forgotten")
-- Clear recent files history
-- Clear all log files
-- Delete ALL stored data completely
+Logs rotate at 5 MB with up to five archives. Clearing logs writes a new audit
+entry recording the clear action. Deleting all local data exits; a later launch
+can create fresh settings/logs.
 
-### 4. Right to Data Portability
-- Export all settings and data to JSON format
-- Save export to your desktop for backup or transfer
+Privacy changes do not retroactively scrub old logs or metadata. Changing the
+log directory does not move or delete logs from the old location.
 
-### 5. Right to Object
-- Disable username inclusion in file metadata
-- Enable path anonymization in logs
-- Disable recent files tracking
+Deletion does not remove targets, saved checksums, privacy exports, update
+backups, the script, BLAKE3 executables, or logs in earlier directories. Delete
+those separately when no longer needed. File deletion is not secure erasure.
 
-## Privacy Features
+Auto-copy is off by default. When enabled or requested, checksum text goes to
+the Windows clipboard. Clipboard history/sync and other applications are outside
+this utility's control. Exiting or deleting local data does not clear the
+clipboard.
 
-### Default Privacy Settings (Privacy-First Design)
+## Contact
 
-By default, the tool is configured for maximum privacy:
-
-- ✅ **Username NOT included** in file metadata
-- ✅ **File paths anonymized** in logs
-- ✅ **Recent files (history) tracking Disabled** by default (GDPR compliant)
-
-### Privacy Controls
-
-Access via: **Main Menu → 6) Privacy & Data Management**
-
-1. **Toggle username in file metadata**
-   - Default: OFF (privacy protected)
-   - When OFF: Files show `[Not recorded - Privacy setting]` instead of username
-   - When OFF: Output filenames exclude username (e.g., `file.SHA256.txt`)
-   - When ON: Output filenames include username (e.g., `file.SHA256.Username.txt`)
-
-2. **Toggle path anonymization in logs**
-   - Default: ON (privacy protected)
-   - When ON: File paths replaced with `[PATH_REDACTED]` in logs
-   - When ON: Metadata files show only filename, not full path
-
-3. **View all stored data**
-   - Transparent access to everything we store
-
-4. **Clear recent files history**
-   - Remove all tracked file paths
-
-5. **Clear all logs**
-   - Permanently delete all log files
-
-6. **Export all data (JSON)**
-   - Download your data in machine-readable format
-
-7. **Delete ALL stored data**
-   - Complete erasure of settings, logs, and history
-   - Requires typing 'DELETE' to confirm
-
-## Data Retention
-
-- **Settings**: Retained until manually deleted or tool uninstalled
-- **Logs**: Auto-rotated at 5 MB, max 5 archives (self-cleaning)
-- **Recent Files**: Limited to 10 most recent (configurable)
-
-## Data Security
-
-- All data stored locally in user's `%LOCALAPPDATA%` directory
-- No encryption needed as no sensitive data is stored
-- Standard Windows file permissions apply
-- No network transmission of any kind
-
-## Legal Basis for Processing
-
-Under GDPR Article 6(1)(f) - Legitimate interests:
-- Processing is necessary for the application to function
-- No personal data is processed without user control
-- Users can disable/delete data at any time
-
-## Contact & Questions
-
-For questions about privacy:
-- Author: Ruben Draaisma
-- Repository: https://github.com/Dantdmnl/Checksum-Verify
-
-## Changes to Privacy Policy
-
-Any changes to this policy will be reflected in:
-- This PRIVACY.md file
-- Updated version number in script header
-- Changelog documentation
-
-## Consent
-
-By using this tool, you acknowledge:
-1. You understand what data is stored locally
-2. You can access, modify, or delete your data at any time
-3. No data leaves your device
-4. You have full control over privacy settings
-
----
-
-**Version History:**
-- v1.5.0 (2026-04-05): Added support for parallel hashing of multiple algorithms, extended parser to recognize pure hex checksum files, intelligent extraction of checksums from block text, and disabled file history by default to comply strictly with GDPR.
-- v1.4.0 (2025-12-18): Added auto-discovery of checksum files, enhanced filename matching (exact match prevents .iso vs .iso.xz confusion), cross-platform path support, UTF-8 encoding for checksum files, improved error messages, and elapsed time display in verification results
-- v1.3.2 (2025-11-28): Fixed privacy leaks - anonymized file paths in metadata and removed username from output filenames when privacy mode enabled
-- v1.3.0 (2025-11-09): Added GDPR compliance features, privacy controls, ESC key support, recent files history, human-readable file sizes, and all approved PowerShell verbs
+Author: Ruben Draaisma. Questions and issues:
+[Checksum-Verify repository](https://github.com/Dantdmnl/Checksum-Verify).

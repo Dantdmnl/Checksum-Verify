@@ -3,7 +3,7 @@
     Checksum Tool with persistent settings and single-key main-menu navigation.
 
 .DESCRIPTION
-    - Streaming checksum calculation with progress (MD5/SHA1/SHA256/SHA384/SHA512)
+    - Streaming checksums with progress (MD5/SHA1/SHA2/SHA3/CRC32 and optional BLAKE3)
     - Stable throttled Write-Progress and Int64-safe math for large files
     - Quick-save and metadata-save functions (fast file writes)
     - Clipboard copy (Set-Clipboard preferred, fallback to Windows.Forms clipboard)
@@ -21,7 +21,7 @@
     - Auto-discovery of checksum files in target file directory, including target.iso.SHA256.txt
     - Cross-platform path handling for checksum files
     - All functions use approved PowerShell verbs
-    - GDPR compliant with privacy controls
+    - Local privacy controls and user-initiated verified updates
 
 .PRIVACY
     This tool stores local data for functionality:
@@ -30,18 +30,22 @@
     - Recent files: File paths only (no file contents)
     - Username: Optional, only in file metadata if enabled
     
-    All data is stored locally on your device. No data is transmitted externally.
+    Settings, logs, and history stay local. Optional updates and BLAKE3 setup
+    contact GitHub; selected file contents and checksum input are not uploaded.
     You can view, export, or delete all stored data via the Privacy menu.
 
 .NOTES
     - Author: Ruben Draaisma
-    - Version: 1.6.0
+    - Version: 1.7.0
     - Tested on: Windows 11 24H2
     - Tested with: PowerShell ISE, PowerShell 5.1 and PowerShell 7
 #>
 
+param([switch] $NoMenu)
+
 #region Version & helper: settings path
-$ScriptVersion = '1.6.0'
+$ScriptVersion = '1.7.0'
+$script:ApplicationPath = $PSCommandPath
 
 function Get-SettingsFilePath {
     try {
@@ -81,20 +85,20 @@ $Global:LogLevels      = @{ "DEBUG"=1; "INFO"=2; "WARN"=3; "ERROR"=4; "CRITICAL"
 
 function Invoke-LogRotation {
     try {
-        if (-not (Test-Path -Path $Global:LogFile)) { return }
-        $fileSizeMB = (Get-Item $Global:LogFile).Length / 1MB
+        if (-not (Test-Path -LiteralPath $Global:LogFile)) { return }
+        $fileSizeMB = (Get-Item -LiteralPath $Global:LogFile).Length / 1MB
         if ($fileSizeMB -lt $Global:MaxLogSizeMB) { return }
 
         $oldest = "$Global:LogFile.$Global:MaxLogArchives.log"
-        if (Test-Path $oldest) { Remove-Item -Path $oldest -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $oldest) { Remove-Item -LiteralPath $oldest -Force -ErrorAction Stop }
 
         for ($i = $Global:MaxLogArchives - 1; $i -ge 1; $i--) {
             $oldLog = "$Global:LogFile.$i.log"
             $newLog = "$Global:LogFile.$($i + 1).log"
-            if (Test-Path $oldLog) { Rename-Item -Path $oldLog -NewName $newLog -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $oldLog) { Move-Item -LiteralPath $oldLog -Destination $newLog -Force -ErrorAction Stop }
         }
 
-        Rename-Item -Path $Global:LogFile -NewName "$Global:LogFile.1.log" -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $Global:LogFile -Destination "$Global:LogFile.1.log" -Force -ErrorAction Stop
     } catch { }
 }
 
@@ -110,13 +114,13 @@ function Write-LogMessage {
         
         # Anonymize file paths if enabled (GDPR privacy)
         if ($Global:Settings.AnonymizeLogPaths) {
-            $Message = $Message -replace '([C-Z]:\\[^"'']+)', '[PATH_REDACTED]'
+            $Message = $Message -replace '([A-Z]:[\\/][^"'']+)', '[PATH_REDACTED]'
             $Message = $Message -replace '(\\\\[^"'']+)', '[UNC_PATH_REDACTED]'
         }
         
         $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        $entry = "{""timestamp"":""$ts"",""level"":""$Level"",""message"":""$Message""}"
-        $entry | Out-File -FilePath $Global:LogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+        $entry = [PSCustomObject]@{ timestamp = $ts; level = $Level; message = $Message } | ConvertTo-Json -Compress
+        [IO.File]::AppendAllText($Global:LogFile, $entry + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     } catch {}
 }
 #endregion
@@ -125,16 +129,27 @@ function Write-LogMessage {
 function Save-Settings {
     param([Parameter(Mandatory=$true)] $Settings)
     $path = Get-SettingsFilePath
+    $temporaryPath = $null
+    $backupPath = $null
     try {
         $dir = Split-Path -Parent $path
         if (-not (Test-Path -LiteralPath $dir)) { try { New-Item -ItemType Directory -Path $dir -Force | Out-Null } catch {} }
         $json = $Settings | ConvertTo-Json -Depth 4 -ErrorAction Stop
-        $json | Set-Content -LiteralPath $path -Encoding UTF8 -Force
+        $temporaryPath = Join-Path $dir ([IO.Path]::GetRandomFileName())
+        [IO.File]::WriteAllText($temporaryPath, $json, [Text.UTF8Encoding]::new($false))
+        if ([IO.File]::Exists($path)) {
+            $backupPath = Join-Path $dir ([IO.Path]::GetRandomFileName())
+            [IO.File]::Replace($temporaryPath, $path, $backupPath)
+        }
+        else { [IO.File]::Move($temporaryPath, $path) }
         Write-LogMessage -Message ("Settings saved to {0}" -f $path) -Level INFO
         return $true
     } catch {
         Write-LogMessage -Message ("Failed saving settings: {0}" -f $_.Exception.Message) -Level ERROR
         return $false
+    } finally {
+        if ($temporaryPath -and [IO.File]::Exists($temporaryPath)) { [IO.File]::Delete($temporaryPath) }
+        if ($backupPath -and [IO.File]::Exists($backupPath)) { [IO.File]::Delete($backupPath) }
     }
 }
 
@@ -190,6 +205,21 @@ function ConvertTo-NormalizedSettings {
         if ($gb -lt 0) { $Obj.LargeFileSizeWarningGB = $defaults.LargeFileSizeWarningGB } else { $Obj.LargeFileSizeWarningGB = [double]$gb }
     } catch { $Obj.LargeFileSizeWarningGB = $defaults.LargeFileSizeWarningGB }
 
+    foreach ($name in @('IncludeUsernameInMetadata', 'AnonymizeLogPaths')) {
+        $value = $Obj.$name
+        if ($value -is [bool]) { continue }
+        if ("$value" -match '^(true|yes|1)$') { $Obj.$name = $true }
+        elseif ("$value" -match '^(false|no|0)$') { $Obj.$name = $false }
+        else { $Obj.$name = $defaults.$name }
+    }
+    foreach ($name in @('ProgressMinDeltaPercent', 'LargeFileSizeWarningGB')) {
+        $value = [double]$Obj.$name
+        if ([double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -lt 0 -or ($name -eq 'ProgressMinDeltaPercent' -and $value -gt 100)) { $Obj.$name = $defaults.$name }
+    }
+    $limit = 0
+    if (-not [int]::TryParse("$($Obj.MaxRecentFiles)", [ref]$limit) -or $limit -lt 1 -or $limit -gt 100) { $limit = $defaults.MaxRecentFiles }
+    $Obj.MaxRecentFiles = $limit
+    $Obj.RecentFiles = @($Obj.RecentFiles | Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique -First $limit)
     return $Obj
 }
 
@@ -263,7 +293,7 @@ function Format-FileSize {
 function Copy-ToClipboard {
     param([Parameter(Mandatory=$true)][string] $Text)
     if (Get-Command -Name Set-Clipboard -ErrorAction SilentlyContinue) {
-        try { Set-Clipboard -Value $Text; return $true } catch { Write-LogMessage -Message ("Set-Clipboard failed: {0}" -f $_.Exception.Message) -Level WARN }
+        try { Set-Clipboard -Value $Text -ErrorAction Stop; return $true } catch { Write-LogMessage -Message ("Set-Clipboard failed: {0}" -f $_.Exception.Message) -Level WARN }
     }
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
@@ -300,15 +330,9 @@ function Get-ConfirmedClipboardChecksumText {
     $targetName = if ($TargetFile) { Split-Path -Leaf $TargetFile } else { $null }
     $parsed = $null
     try {
-        $tempChecksumFile = [System.IO.Path]::GetTempFileName()
-        [System.IO.File]::WriteAllText($tempChecksumFile, $clipboardText, [System.Text.Encoding]::UTF8)
-        $parsed = Get-ChecksumFromFile -Path $tempChecksumFile -TargetFilename $targetName
+        $parsed = ConvertFrom-ChecksumText -Text $clipboardText -TargetFilename $targetName
     } catch {
         $parsed = $null
-    } finally {
-        if ($tempChecksumFile -and (Test-Path -LiteralPath $tempChecksumFile)) {
-            try { Remove-Item -LiteralPath $tempChecksumFile -Force -ErrorAction SilentlyContinue } catch {}
-        }
     }
 
     Write-Host ""
@@ -375,7 +399,7 @@ function Show-ChecksumResults {
     Write-MenuHeader -Title "Checksum Result" -Subtitle ("{0} | {1}" -f $fileName, $fileSize)
 
     foreach ($res in $Results) {
-        Write-Host ("  {0,-7} {1}" -f $res.Algorithm, $res.Checksum) -ForegroundColor Green
+        Write-Host ("  {0,-10} {1}" -f $res.Algorithm, $res.Checksum) -ForegroundColor Green
     }
 
     Write-Host ""
@@ -524,6 +548,7 @@ function Select-File {
     $selectedFile = $null
 
     if ($Global:Settings.UseFileDialog) {
+        $fileDialog = $null
         try {
             Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
             $fileDialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -538,7 +563,7 @@ function Select-File {
         } catch {
             Write-LogMessage -Message ("OpenFileDialog failed: {0}" -f $_.Exception.Message) -Level WARN
             return $null
-        }
+        } finally { if ($fileDialog) { $fileDialog.Dispose() } }
     } else {
         # CLI mode - type or paste path
         Write-Host ""
@@ -579,10 +604,10 @@ function Select-File {
             $fileSize = Format-FileSize -Bytes $fileInfo.Length
             
             # Warn for very large files (configurable threshold)
-            $warningThresholdBytes = [int64]($Global:Settings.LargeFileSizeWarningGB * 1GB)
+            $warningThresholdBytes = $Global:Settings.LargeFileSizeWarningGB * 1GB
             if ($fileInfo.Length -gt $warningThresholdBytes) {
                 Write-Host ""
-                Write-Host ("Large file warning: {0}. Processing may take several minutes." -f $fileSize) -ForegroundColor Yellow
+                Write-Host ("Large file: {0}." -f $fileSize) -ForegroundColor Yellow
                 $confirm = Read-Host "Continue? (Y/N) [Y]"
                 if ($confirm -match '^[nN]') {
                     Write-Host "Cancelled by user." -ForegroundColor Yellow
@@ -601,32 +626,54 @@ function Select-File {
 #region Algorithm selection
 function Select-AlgorithmMenu {
     param([string] $Prompt = "Select algorithm", [string] $Default = "SHA256", [switch] $AllowAll)
-    if ($AllowAll) {
-        $map = @{ '1'='MD5'; '2'='SHA1'; '3'='SHA256'; '4'='SHA384'; '5'='SHA512'; '6'='ALL' }
-    } else {
-        $map = @{ '1'='MD5'; '2'='SHA1'; '3'='SHA256'; '4'='SHA384'; '5'='SHA512' }
+    $available = @(Get-SupportedChecksumAlgorithms)
+    $map = @{}
+    $index = 1
+    foreach ($algorithm in @('SHA256','SHA384','SHA512','CRC32','MD5','SHA1','SHA3-256','SHA3-512')) {
+        if ($algorithm -in $available) { $map[[string]$index] = $algorithm; $index++ }
     }
-    
+    if ($AllowAll) { $map['A'] = 'ALL' }
+    if ('BLAKE3' -in $available) { $map['B'] = 'BLAKE3' }
     while ($true) {
         Write-Host ""
         Write-MenuHeader -Title $Prompt -Subtitle ("Default: {0}" -f $Default)
-        Write-Host "  1) MD5       legacy, accidental corruption only" -ForegroundColor DarkGray
-        Write-Host "  2) SHA-1     legacy, accidental corruption only" -ForegroundColor DarkGray
-        Write-Host "  3) SHA-256   recommended default" -ForegroundColor White
-        Write-Host "  4) SHA-384" -ForegroundColor White
-        Write-Host "  5) SHA-512" -ForegroundColor White
-        if ($AllowAll) { Write-Host "  6) ALL       one read, all supported hashes" -ForegroundColor White }
+        foreach ($key in @($map.Keys | Where-Object { $_ -match '^\d+$' } | Sort-Object { [int]$_ })) {
+            $algorithm = $map[$key]
+            $detail = switch ($algorithm) {
+                'SHA256' { 'Recommended default' }
+                'CRC32' { 'SFV / accidental corruption' }
+                'MD5' { 'Legacy' }
+                'SHA1' { 'Legacy' }
+                default { '' }
+            }
+            Write-Host ('  {0}) {1,-10} {2}' -f $key, $algorithm, $detail) -ForegroundColor White
+        }
+        if ($AllowAll) { Write-Host '  A) ALL        One read, all available hashes' -ForegroundColor White }
+        if ($map.ContainsKey('B')) { Write-Host '  B) BLAKE3' -ForegroundColor White }
+        else { Write-Host '  B) BLAKE3     Install support' -ForegroundColor DarkGray }
         Write-Host "  0) Back" -ForegroundColor DarkGray
         Write-Host ""
         
-        $optRange = if ($AllowAll) { "0-6" } else { "0-5" }
+        $optRange = '1-' + ($index - 1) + $(if ($AllowAll) { ', A' }) + ', B, 0'
         Write-Host ("Choose ({0})  Enter={1}  ESC=Back" -f $optRange, $Default) -ForegroundColor DarkGray
         
         $choice = Read-SingleKey
-        try { $choice = [string]$choice; $choice = $choice.Trim() } catch {}
+        try { $choice = [string]$choice; $choice = $choice.Trim().ToUpperInvariant() } catch {}
         if ([string]::IsNullOrWhiteSpace($choice)) { return $Default }
         if ($choice -eq [char]27 -or $choice -match '^\x1B') { return $null }
         if ($map.ContainsKey($choice)) { return $map[$choice] }
+        if ($choice -eq 'B') {
+            Write-Host 'BLAKE3 requires the official b3sum.exe. Installation downloads a verified Windows x64 release from GitHub beside this script.' -ForegroundColor Yellow
+            if ((Read-Host 'Download and install BLAKE3 support? [y/N]').Trim() -ieq 'y') {
+                try {
+                    $installed = Install-Blake3Tool -Directory (Split-Path -Parent $script:ApplicationPath)
+                    if (-not (Get-Blake3Executable)) { throw 'Installed executable could not be found.' }
+                    Write-Host "Installed $($installed.Version). Using BLAKE3." -ForegroundColor Green
+                    return 'BLAKE3'
+                } catch { Write-Host "BLAKE3 setup failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+            }
+            continue
+        }
         if ($choice -eq '0') { return $null }
         Write-Host "Invalid choice, try again." -ForegroundColor Yellow
     }
@@ -634,29 +681,143 @@ function Select-AlgorithmMenu {
 #endregion
 
 #region Core checksum functions
+function Get-SupportedChecksumAlgorithms {
+    'MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512'
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'CRC32' }
+    if (Get-Blake3Executable) { 'BLAKE3' }
+    foreach ($name in @('SHA3-256', 'SHA3-512')) {
+        $type = ('System.Security.Cryptography.' + ($name -replace '-', '_')) -as [type]
+        if ($type -and $type.GetProperty('IsSupported').GetValue($null, $null)) { $name }
+    }
+}
+
+function Get-ChecksumDigestLength {
+    param([string] $Algorithm)
+    switch ($Algorithm) {
+        'CRC32' { 8 }
+        'BLAKE3' { 64 }
+        'MD5' { 32 }
+        'SHA1' { 40 }
+        'SHA256' { 64 }
+        'SHA3-256' { 64 }
+        'SHA384' { 96 }
+        'SHA512' { 128 }
+        'SHA3-512' { 128 }
+        default { 0 }
+    }
+}
+
+function Initialize-Crc32 {
+    if ('ChecksumVerify.NativeCrc32' -as [type]) { return }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'CRC32 requires Windows.' }
+    # Windows supplies the cumulative IEEE CRC32 implementation; no CRC engine is embedded.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace ChecksumVerify {
+    public static class NativeCrc32 {
+        [DllImport("ntdll.dll", ExactSpelling = true, CallingConvention = CallingConvention.Winapi)]
+        public static extern uint RtlComputeCrc32(uint initial, byte[] data, uint length);
+    }
+}
+'@ -ErrorAction Stop
+}
+
+function Get-Blake3Executable {
+    if ($script:ApplicationPath) {
+        $besideScript = Join-Path (Split-Path -Parent $script:ApplicationPath) 'b3sum.exe'
+        if (Test-Path -LiteralPath $besideScript -PathType Leaf) { return $besideScript }
+    }
+    $command = Get-Command -Name b3sum.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    return $null
+}
+
+function ConvertTo-Blake3ReleaseInfo {
+    param([Parameter(Mandatory=$true)] $Release)
+    if ($Release.draft -or $Release.prerelease -or $Release.tag_name -cnotmatch '^[Vv]?\d+\.\d+\.\d+$') { throw 'Expected a stable BLAKE3 release.' }
+    $assets = @($Release.assets | Where-Object { $_.name -ceq 'b3sum_windows_x64_bin.exe' -and $_.state -eq 'uploaded' })
+    if ($assets.Count -ne 1) { throw 'The release has no unique Windows x64 b3sum asset.' }
+    $asset = $assets[0]
+    $url = "https://github.com/BLAKE3-team/BLAKE3/releases/download/$($Release.tag_name)/b3sum_windows_x64_bin.exe"
+    if ($asset.browser_download_url -cne $url -or $asset.digest -notmatch '^sha256:[a-fA-F0-9]{64}$' -or [long]$asset.size -le 0 -or [long]$asset.size -gt 10MB) { throw 'BLAKE3 release metadata did not pass validation.' }
+    [PSCustomObject]@{ DownloadUrl = $url; Digest = [string]$asset.digest; Size = [long]$asset.size; Tag = [string]$Release.tag_name }
+}
+
+function Install-Blake3Tool {
+    param([Parameter(Mandatory=$true)][string] $Directory)
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or -not [Environment]::Is64BitOperatingSystem) { throw 'Automatic BLAKE3 setup requires 64-bit Windows. Install a compatible b3sum manually.' }
+    $Directory = (Get-Item -LiteralPath $Directory -ErrorAction Stop).FullName
+    $destination = Join-Path $Directory 'b3sum.exe'
+    if (Test-Path -LiteralPath $destination) { throw 'b3sum.exe already exists; it will not be overwritten.' }
+    $stage = Join-Path $Directory ('.b3sum.' + [guid]::NewGuid().ToString('N') + '.download')
+    $previousProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/BLAKE3-team/BLAKE3/releases/latest' `
+            -Headers @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'Checksum-Verify-BLAKE3' } -TimeoutSec 20 -ErrorAction Stop
+        $checked = ConvertTo-Blake3ReleaseInfo $release
+        Invoke-WebRequest -Uri $checked.DownloadUrl -UseBasicParsing -TimeoutSec 60 -OutFile $stage -ErrorAction Stop | Out-Null
+        if ((Get-Item -LiteralPath $stage).Length -ne $checked.Size -or ('sha256:' + (Get-FileHash -LiteralPath $stage -Algorithm SHA256).Hash) -ine $checked.Digest) { throw 'The b3sum download failed size or SHA256 verification.' }
+        [IO.File]::Move($stage, $destination)
+        [PSCustomObject]@{ Path = $destination; Version = $checked.Tag }
+    } finally {
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol
+        if ([IO.File]::Exists($stage)) { [IO.File]::Delete($stage) }
+    }
+}
+
+function Start-Blake3Hasher {
+    $executable = Get-Blake3Executable
+    if (-not $executable) { throw 'BLAKE3 needs the official b3sum.exe beside this script or on PATH. See https://github.com/BLAKE3-team/BLAKE3/releases.' }
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $executable
+    $start.Arguments = '--no-names --length 32 --no-mmap'
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw 'Could not start b3sum.' }
+        return [PSCustomObject]@{
+            Process = $process
+            Output = $process.StandardOutput.ReadToEndAsync()
+            Error = $process.StandardError.ReadToEndAsync()
+        }
+    } catch { $process.Dispose(); throw }
+}
+
 function Get-FileChecksumEx {
     [CmdletBinding(DefaultParameterSetName='ByPath')]
     param(
         [Parameter(Mandatory=$true, Position=0)][ValidateNotNullOrEmpty()][string] $Path,
-        [Parameter(Mandatory=$false)][ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512','ALL')][string[]] $Algorithm = @('SHA256'),
+        [Parameter(Mandatory=$false)][ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512','SHA3-256','SHA3-512','CRC32','BLAKE3','ALL')][string[]] $Algorithm = @('SHA256'),
         [Parameter(Mandatory=$false)][ValidateRange(4096, [int]::MaxValue)][int] $BufferSize = (4 * 1MB),
         [Parameter(Mandatory=$false)][switch] $ShowProgress
     )
 
     begin {
         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Throw "File not found: $Path" }
+        $Path = (Get-Item -LiteralPath $Path -ErrorAction Stop).FullName
         if ($BufferSize -lt 4096) { Throw "BufferSize must be at least 4096 bytes." }
         $ProgressUpdateIntervalMs = [int]$Global:Settings.ProgressUpdateIntervalMs
         $ProgressMinDeltaPercent   = [double]$Global:Settings.ProgressMinDeltaPercent
         $progressId = 1
         
         if ($Algorithm -contains 'ALL') {
-            $Algorithm = @('MD5','SHA1','SHA256','SHA384','SHA512')
+            $Algorithm = @(Get-SupportedChecksumAlgorithms)
         }
+        $Algorithm = @($Algorithm | ForEach-Object { $_.ToUpperInvariant() } | Select-Object -Unique)
+        if ($Algorithm.Count -eq 0) { throw 'At least one algorithm must be selected.' }
     }
 
     process {
         $fs = $null; $hashAlgos = @{}
+        $blake3 = $null
+        $crc = [uint32]0
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $originalTitle = $null
         
@@ -665,7 +826,13 @@ function Get-FileChecksumEx {
             try { $originalTitle = $Host.UI.RawUI.WindowTitle } catch { }
             
             foreach ($alg in $Algorithm) {
-                $h = [System.Security.Cryptography.HashAlgorithm]::Create($alg)
+                if ($alg -eq 'CRC32') { Initialize-Crc32; continue }
+                if ($alg -eq 'BLAKE3') { $blake3 = Start-Blake3Hasher; continue }
+                if ($alg -like 'SHA3-*') {
+                    $type = ('System.Security.Cryptography.' + ($alg -replace '-', '_')) -as [type]
+                    if (-not $type -or $alg -notin @(Get-SupportedChecksumAlgorithms)) { throw "$alg is not supported by this PowerShell runtime." }
+                    $h = $type.GetMethod('Create', [type[]]@()).Invoke($null, @())
+                } else { $h = [System.Security.Cryptography.HashAlgorithm]::Create($alg) }
                 if (-not $h) { Throw "Unable to create hash algorithm '$alg'." }
                 $hashAlgos[$alg] = $h
             }
@@ -682,6 +849,14 @@ function Get-FileChecksumEx {
 
             while (($bytesRead = $fs.Read($buffer, 0, $buffer.Length)) -gt 0) {
                 foreach ($alg in $Algorithm) {
+                    if ($alg -eq 'CRC32') {
+                        $crc = [ChecksumVerify.NativeCrc32]::RtlComputeCrc32($crc, $buffer, [uint32]$bytesRead)
+                        continue
+                    }
+                    if ($alg -eq 'BLAKE3') {
+                        $blake3.Process.StandardInput.BaseStream.Write($buffer, 0, $bytesRead)
+                        continue
+                    }
                     $hashAlgos[$alg].TransformBlock($buffer, 0, $bytesRead, $null, 0) | Out-Null
                 }
                 $totalRead += [int64]$bytesRead
@@ -692,18 +867,18 @@ function Get-FileChecksumEx {
                     $timeSince = ($now - $lastUpdate).TotalMilliseconds
                     $deltaPercent = [math]::Abs($percent - $lastPercent)
 
-                    if ($timeSince -ge $ProgressUpdateIntervalMs -or $deltaPercent -ge $ProgressMinDeltaPercent) {
+                    if ($timeSince -ge $ProgressUpdateIntervalMs -and ($deltaPercent -ge $ProgressMinDeltaPercent -or $timeSince -ge ($ProgressUpdateIntervalMs * 5) -or $percent -ge 100)) {
                         $elapsedSec = [math]::Max(0.001, $sw.Elapsed.TotalSeconds)
                         $speedBytesPerSec = if ($elapsedSec -gt 0) { [double]$totalRead / $elapsedSec } else { 0.0 }
 
                         $remainingBytes = [math]::Max([int64]0, [int64]($length - $totalRead))
                         $etaSec = if ($speedBytesPerSec -gt 0) { [math]::Round($remainingBytes / $speedBytesPerSec) } else { 0 }
-                        $remainingMB = [math]::Round([double]$remainingBytes / 1MB, 2)
+                        $processedMB = [math]::Round([double]$totalRead / 1MB, 2)
                         $totalMB = [math]::Round([double]$length / 1MB, 2)
                         $speedMBps = [math]::Round($speedBytesPerSec / 1MB, 2)
 
                         Write-Progress -Id $progressId -Activity ("Calculating {0} checksum(s)" -f $algNameStr) `
-                                       -Status ("{0:N2}% - {1} MB of {2} MB @ {3} MB/s - ETA: {4}s" -f $percent, $remainingMB, $totalMB, $speedMBps, $etaSec) `
+                                       -Status ("{0:N2}% - {1} MB of {2} MB @ {3} MB/s - ETA: {4}s" -f $percent, $processedMB, $totalMB, $speedMBps, $etaSec) `
                                        -PercentComplete ([math]::Min(100, [math]::Round($percent, 2)))
                         
                         # Update window title with progress
@@ -719,9 +894,20 @@ function Get-FileChecksumEx {
 
             $results = @()
             foreach ($alg in $Algorithm) {
-                $hashAlgos[$alg].TransformFinalBlock($buffer, 0, 0) | Out-Null
-                $checksumBytes = $hashAlgos[$alg].Hash
-                $hex = -join ($checksumBytes | ForEach-Object { "{0:x2}" -f $_ })
+                if ($alg -eq 'CRC32') { $hex = $crc.ToString('x8') }
+                elseif ($alg -eq 'BLAKE3') {
+                    $blake3.Process.StandardInput.Close()
+                    if (-not $blake3.Process.WaitForExit(60000)) { throw 'b3sum did not finish after its input closed.' }
+                    $hex = $blake3.Output.GetAwaiter().GetResult().Trim()
+                    $errorText = $blake3.Error.GetAwaiter().GetResult().Trim()
+                    if ($blake3.Process.ExitCode -ne 0) { throw "b3sum failed (exit $($blake3.Process.ExitCode)): $errorText" }
+                    if ($hex -notmatch '^[0-9a-fA-F]{64}$') { throw 'b3sum returned an invalid digest.' }
+                    $hex = $hex.ToLowerInvariant()
+                } else {
+                    $hashAlgos[$alg].TransformFinalBlock($buffer, 0, 0) | Out-Null
+                    $checksumBytes = $hashAlgos[$alg].Hash
+                    $hex = -join ($checksumBytes | ForEach-Object { "{0:x2}" -f $_ })
+                }
 
                 Write-LogMessage -Message ("Checksum calculated for {0} ({1})" -f $Path, $alg) -Level INFO
 
@@ -758,8 +944,12 @@ function Get-FileChecksumEx {
             }
             Write-Host ""
             
-            return $null
+            throw
         } finally {
+            if ($blake3) {
+                try { if (-not $blake3.Process.HasExited) { $blake3.Process.Kill() } }
+                finally { $blake3.Process.Dispose() }
+            }
             if ($fs) { try { $fs.Close(); $fs.Dispose() } catch {} }
             if ($hashAlgos) { 
                 foreach ($h in $hashAlgos.Values) { if ($h) { $h.Dispose() } }
@@ -776,6 +966,7 @@ function Get-FileChecksumEx {
 
 function Get-ChecksumAlgorithmFromLength { param([string] $Checksum)
     switch ($Checksum.Length) {
+        8   { return 'CRC32' }
         32  { return 'MD5' }
         40  { return 'SHA1' }
         64  { return 'SHA256' }
@@ -790,6 +981,10 @@ function ConvertTo-CanonicalChecksumAlgorithm {
 
     $normalized = $Algorithm.Trim().ToUpperInvariant() -replace '[^A-Z0-9]', ''
     switch ($normalized) {
+        'CRC32'   { return 'CRC32' }
+        'CRC'     { return 'CRC32' }
+        'BLAKE3'  { return 'BLAKE3' }
+        'B3'      { return 'BLAKE3' }
         'MD5'     { return 'MD5' }
         'SHA1'    { return 'SHA1' }
         'SHA256'  { return 'SHA256' }
@@ -798,12 +993,14 @@ function ConvertTo-CanonicalChecksumAlgorithm {
         'SHA2384' { return 'SHA384' }
         'SHA512'  { return 'SHA512' }
         'SHA2512' { return 'SHA512' }
+        'SHA3256' { return 'SHA3-256' }
+        'SHA3512' { return 'SHA3-512' }
         default   { return $null }
     }
 }
 
 function Get-ChecksumRegexPattern {
-    return '(?:[0-9A-Fa-f]{128}|[0-9A-Fa-f]{96}|[0-9A-Fa-f]{64}|[0-9A-Fa-f]{40}|[0-9A-Fa-f]{32})'
+    return '(?:[0-9A-Fa-f]{128}|[0-9A-Fa-f]{96}|[0-9A-Fa-f]{64}|[0-9A-Fa-f]{40}|[0-9A-Fa-f]{32}|[0-9A-Fa-f]{8})'
 }
 
 function Get-ChecksumBase64RegexPattern {
@@ -864,11 +1061,16 @@ function ConvertFrom-GnuEscapedFilename {
 function Test-ChecksumFilenameMatch {
     param(
         [Parameter(Mandatory=$true)][string] $CandidateName,
-        [Parameter(Mandatory=$true)][string] $TargetFilename
+        [Parameter(Mandatory=$true)][string] $TargetFilename,
+        [switch] $Exact
     )
 
     $candidate = $CandidateName.Trim().Trim('"', '''', ':', ',', ';')
     $target = $TargetFilename.Trim().Trim('"', '''', ':', ',', ';')
+    if ($Exact) {
+        $candidate = $CandidateName.Trim().Trim('"', '''')
+        $target = $TargetFilename.Trim().Trim('"', '''')
+    }
     if (-not $candidate -or -not $target) { return $false }
 
     $normalizedCandidate = $candidate -replace '[\\/]', [IO.Path]::DirectorySeparatorChar
@@ -915,14 +1117,8 @@ function ConvertTo-NormalizedChecksum {
     if ($hexMatches -and $hexMatches.Count -gt 0) {
         if ($Algorithm) {
             $canonicalAlgorithm = ConvertTo-CanonicalChecksumAlgorithm -Algorithm $Algorithm
-            $expectedLen = switch ($canonicalAlgorithm) {
-                'MD5'    { 32 }
-                'SHA1'   { 40 }
-                'SHA256' { 64 }
-                'SHA384' { 96 }
-                'SHA512' { 128 }
-                default  { 0 }
-            }
+            if (-not $canonicalAlgorithm) { return $null }
+            $expectedLen = Get-ChecksumDigestLength -Algorithm $canonicalAlgorithm
             if ($expectedLen -gt 0) {
                 # Find matching lengths
                 $lenMatches = @($hexMatches | Where-Object { $_.Length -eq $expectedLen })
@@ -945,7 +1141,10 @@ function ConvertTo-NormalizedChecksum {
 
     # Fallback: strip separators and labels, but only accept exact checksum lengths.
     $stripped = -join (($tmp.ToCharArray() | Where-Object { $_ -match '[0-9A-Fa-f]' }))
-    if ($stripped.Length -gt 0 -and (Test-ChecksumValue -Checksum $stripped)) { return $stripped.ToLower() }
+    if ($tmp -match '^[0-9A-Fa-f\s:-]+$' -and $stripped.Length -gt 0 -and (Test-ChecksumValue -Checksum $stripped)) {
+        if ($Algorithm -and $stripped.Length -ne (Get-ChecksumDigestLength -Algorithm (ConvertTo-CanonicalChecksumAlgorithm -Algorithm $Algorithm))) { return $null }
+        return $stripped.ToLowerInvariant()
+    }
 
     return $null
 }
@@ -962,7 +1161,7 @@ function Find-ChecksumFiles {
     $targetBase = [IO.Path]::GetFileNameWithoutExtension($targetName)
     $checksumPattern = Get-ChecksumRegexPattern
     $base64Pattern = Get-ChecksumBase64RegexPattern
-    $algorithmExtensions = @('md5', 'sha1', 'sha256', 'sha384', 'sha512')
+    $algorithmExtensions = @('md5', 'sha1', 'sha256', 'sha384', 'sha512', 'sha3-256', 'sha3-512', 'crc32', 'sfv', 'blake3', 'b3')
 
     $foundFiles = @()
     $maxDiscoveryFileSizeBytes = 10MB
@@ -1004,17 +1203,18 @@ function Find-ChecksumFiles {
         try {
             $searchPath = Join-Path -Path $targetDir -ChildPath $pattern
             $matchedFiles = @(Get-ChildItem -LiteralPath $searchPath -File -Force -ErrorAction SilentlyContinue)
-            foreach ($matchedFile in $matchedFiles) {
+            foreach ($matchedFile in ($matchedFiles | Where-Object { $_.Length -le $maxDiscoveryFileSizeBytes })) {
                 if ($matchedFile.FullName -ne $TargetFilePath) {
                     $discoveryStats.CandidateCount++
                     try {
-                        $sample = Get-Content -LiteralPath $matchedFile.FullName -First 10 -ErrorAction SilentlyContinue
+                        $sample = Get-Content -LiteralPath $matchedFile.FullName -Encoding UTF8 -ErrorAction SilentlyContinue
                         if ($sample) {
                             $hasChecksum = $sample | Where-Object {
                                 $_ -match "(?<![0-9A-Fa-f])$checksumPattern(?![0-9A-Fa-f])" -or
                                 $_ -match "(?<![A-Za-z0-9+/=])$base64Pattern(?![A-Za-z0-9+/=])"
                             }
-                            if ($hasChecksum) {
+                            $targetChecksum = Get-ChecksumFromFile -Path $matchedFile.FullName -TargetFilename $targetName
+                            if ($hasChecksum -and $targetChecksum) {
                                 $discoveryStats.ParsedCount++
                                 Write-Verbose ("Found checksum file: {0}" -f $matchedFile.Name)
                                 $foundFiles += [PSCustomObject]@{
@@ -1066,23 +1266,15 @@ function Find-ChecksumFiles {
             $discoveryStats.CandidateCount++
             
             try {
-                $sample = Get-Content -LiteralPath $file.FullName -First 10 -ErrorAction SilentlyContinue
+                $sample = Get-Content -LiteralPath $file.FullName -Encoding UTF8 -ErrorAction SilentlyContinue
                 if ($sample) {
                     $hasChecksum = $sample | Where-Object {
                         $_ -match "(?<![0-9A-Fa-f])$checksumPattern(?![0-9A-Fa-f])" -or
                         $_ -match "(?<![A-Za-z0-9+/=])$base64Pattern(?![A-Za-z0-9+/=])"
                     }
-                    $nameLooksSpecific = (
-                        $file.Name -match ('(?i){0}' -f [regex]::Escape($targetName)) -or
-                        $file.Name -match ('(?i){0}' -f [regex]::Escape($targetBase)) -or
-                        $file.Name -match '(?i)^(checksum|checksums|sha\d+|md5|hash)' -or
-                        $file.Name -match '(?i)(checksum|checksums|hash|hashes)' -or
-                        $file.Name -match '(?i)\.(sha1|sha256|sha384|sha512|md5|checksum|hash|hashes)($|\.)' -or
-                        $file.Name -match '(?i)sums$'
-                    )
                     $parsedForTarget = $null
                     try { $parsedForTarget = Get-ChecksumFromFile -Path $file.FullName -TargetFilename $targetName } catch {}
-                    if ($hasChecksum -and ($nameLooksSpecific -or ($parsedForTarget -and $parsedForTarget.Checksum))) {
+                    if ($hasChecksum -and $parsedForTarget -and $parsedForTarget.Checksum) {
                         $discoveryStats.ParsedCount++
                         Write-Verbose ("Found checksum file via directory scan: {0}" -f $file.Name)
                         $foundFiles += [PSCustomObject]@{
@@ -1108,6 +1300,10 @@ function Get-AlgorithmFromFilename {
     param([Parameter(Mandatory=$true)][string] $Filename)
 
     $lower = $Filename.ToLower()
+    if ($lower -match '\.(sfv|crc32|crc)(\.txt)?$') { return 'CRC32' }
+    if ($lower -match '(blake3|\.b3(?:\.|$))') { return 'BLAKE3' }
+    if ($lower -match 'sha3[-_]?256') { return 'SHA3-256' }
+    if ($lower -match 'sha3[-_]?512') { return 'SHA3-512' }
 
     # Check file extension first
     if ($lower -match '\.sha512(\.txt)?$|sha512sums') { return 'SHA512' }
@@ -1129,7 +1325,8 @@ function Get-AlgorithmFromFilename {
 function Get-ChecksumFromFile {
     param(
         [Parameter(Mandatory=$true)][string] $Path,
-        [Parameter(Mandatory=$false)][string] $TargetFilename
+        [Parameter(Mandatory=$false)][string] $TargetFilename,
+        [string] $Algorithm
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Throw "Checksum file not found: $Path" }
@@ -1146,11 +1343,20 @@ function Get-ChecksumFromFile {
         Throw "Unable to read checksum file: $($_.Exception.Message)"
     }
 
+    $hint = if ($Algorithm) { $Algorithm } else { Get-AlgorithmFromFilename -Filename (Split-Path -Leaf $Path) }
+    return ConvertFrom-ChecksumText -Text ($lines -join "`n") -TargetFilename $TargetFilename -Algorithm $Algorithm -DefaultAlgorithm $hint
+}
+
+function ConvertFrom-ChecksumText {
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string] $Text,
+          [string] $TargetFilename, [string] $Algorithm, [string] $DefaultAlgorithm)
+    if (-not $DefaultAlgorithm -and $Algorithm) { $DefaultAlgorithm = $Algorithm }
+    $lines = $Text -split '\r?\n'
     $candidates = @()
     $lineNum = 0
     $checksumPattern = Get-ChecksumRegexPattern
     $base64Pattern = Get-ChecksumBase64RegexPattern
-    $algorithmPattern = 'MD5|SHA-?1|SHA-?256|SHA2-?256|SHA-?384|SHA2-?384|SHA-?512|SHA2-?512'
+    $algorithmPattern = 'CRC-?32|CRC|BLAKE3|B3|MD5|SHA-?1|SHA3-?256|SHA3-?512|SHA-?256|SHA2-?256|SHA-?384|SHA2-?384|SHA-?512|SHA2-?512'
     $metadataFileName = $null
     $metadataAlgorithm = $null
 
@@ -1186,15 +1392,31 @@ function Get-ChecksumFromFile {
             if (-not $hex) { continue }
             $alg = ConvertTo-CanonicalChecksumAlgorithm -Algorithm $matches['alg']
             if (-not $alg) { $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex }
+            if ($hex.Length -ne (Get-ChecksumDigestLength $alg)) {
+                $decoded = ConvertTo-HexChecksumFromBase64 -Base64 $digest
+                if ($decoded) { $hex = $decoded }
+            }
             $fileMention = $false
+            $entryFilename = $null
             # Extract filename from parentheses if present: "SHA512 (filename) = hash"
             # Match the last set of parentheses before the equals/colon sign
-            if ($TargetFilename -and $line -match '\(([^)]+)\)\s*(?:=|:)') {
-                $fileMention = Test-ChecksumFilenameMatch -CandidateName $matches[1] -TargetFilename $TargetFilename
-            } elseif ($TargetFilename -and (Test-ChecksumLineReferencesTarget -Line $line -TargetFilename $TargetFilename)) {
-                $fileMention = $true
+            if ($line -match '\((.+)\)\s*(?:=|:)') {
+                $entryFilename = $matches[1]
+                if ($TargetFilename) { $fileMention = Test-ChecksumFilenameMatch -CandidateName $entryFilename -TargetFilename $TargetFilename }
+            } elseif ($line -match ('(?i)^(?:{0})\s+(?<file>.+?)\s*=' -f $algorithmPattern)) {
+                $entryFilename = $matches['file']
+                if ($TargetFilename) { $fileMention = Test-ChecksumFilenameMatch -CandidateName $entryFilename -TargetFilename $TargetFilename }
             }
-            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $true }
+            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $true; Filename = $entryFilename }
+            continue
+        }
+
+        # SFV lists the filename first, followed by an IEEE CRC32 digest.
+        if ($line -match '^(?<fname>.+?)\s+(?<digest>[0-9A-Fa-f]{8})$') {
+            $fname = $matches['fname']
+            $hex = $matches['digest'].ToLowerInvariant()
+            $fileMention = $TargetFilename -and (Test-ChecksumFilenameMatch $fname $TargetFilename -Exact)
+            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = 'CRC32'; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $fileMention; Filename = $fname }
             continue
         }
 
@@ -1205,13 +1427,13 @@ function Get-ChecksumFromFile {
             if (-not $hex) { continue }
             $fname = $matches['fname'].Trim("`"", "'")
             if ($gnuEscapedLine) { $fname = ConvertFrom-GnuEscapedFilename -Filename $fname }
-            $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
+            $alg = if ($DefaultAlgorithm -and (Get-ChecksumDigestLength $DefaultAlgorithm) -eq $hex.Length) { $DefaultAlgorithm } else { Get-ChecksumAlgorithmFromLength -Checksum $hex }
             $fileMention = $false
             # For extracted filename, check exact match with path normalization
             if ($TargetFilename) {
                 $fileMention = Test-ChecksumFilenameMatch -CandidateName $fname -TargetFilename $TargetFilename
             }
-            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $fileMention }
+            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $fileMention; Filename = $fname }
             continue
         }
 
@@ -1220,12 +1442,12 @@ function Get-ChecksumFromFile {
             $digest = $matches['digest']
             $hex = if (Test-ChecksumValue -Checksum $digest) { $digest.ToLower() } else { ConvertTo-HexChecksumFromBase64 -Base64 $digest }
             if (-not $hex) { continue }
-            $alg = if ($metadataAlgorithm) { $metadataAlgorithm } else { Get-ChecksumAlgorithmFromLength -Checksum $hex }
+            $alg = if ($metadataAlgorithm) { $metadataAlgorithm } elseif ($DefaultAlgorithm) { $DefaultAlgorithm } else { Get-ChecksumAlgorithmFromLength -Checksum $hex }
             $fileMention = ($TargetFilename -and (
                 (Test-ChecksumLineReferencesTarget -Line $line -TargetFilename $TargetFilename) -or
                 ($metadataFileName -and (Test-ChecksumFilenameMatch -CandidateName $metadataFileName -TargetFilename $TargetFilename))
             ))
-            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $true }
+            $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $fileMention; Preferred = $true; Filename = $metadataFileName }
             continue
         }
 
@@ -1234,15 +1456,19 @@ function Get-ChecksumFromFile {
             $digest = $matches['digest']
             $hex = if (Test-ChecksumValue -Checksum $digest) { $digest.ToLower() } else { ConvertTo-HexChecksumFromBase64 -Base64 $digest }
             if (-not $hex) { continue }
-            $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
+            $alg = if ($DefaultAlgorithm -and (Get-ChecksumDigestLength $DefaultAlgorithm) -eq $hex.Length) { $DefaultAlgorithm } else { Get-ChecksumAlgorithmFromLength -Checksum $hex }
             $candidates += [PSCustomObject]@{ Checksum = $hex; Algorithm = $alg; Line = $line; LineNumber = $lineNum; FilenameMatch = $false; Preferred = $true }
             continue
         }
 
         # 5) Generic: find any hex runs (32..128) on the line and treat them as potential checksums
+        if ($line -match '(?i)^Algorithm\s*[:=]' -or $line -match '(?i)^(?:MD\d+|SHA[\w-]+|BLAKE[\w-]+)\b.*(?:=|:)') {
+            throw "Unsupported algorithm label on line $lineNum."
+        }
         $hexMatches = [regex]::Matches($line, "(?<![0-9A-Fa-f])$checksumPattern(?![0-9A-Fa-f])") | ForEach-Object { $_.Value }
         if ($hexMatches -and $hexMatches.Count -gt 0) {
             foreach ($hm in $hexMatches) {
+                if ($hm.Length -eq 8) { continue }
                 $hex = $hm.ToLower()
                 $alg = Get-ChecksumAlgorithmFromLength -Checksum $hex
                 $fileMention = $false
@@ -1254,7 +1480,30 @@ function Get-ChecksumFromFile {
         }
     }
 
+    $candidates = @($candidates | Where-Object { $_.Checksum })
+    if ($TargetFilename) {
+        foreach ($candidate in $candidates) {
+            if ($candidate.Filename) { $candidate.FilenameMatch = Test-ChecksumFilenameMatch -CandidateName $candidate.Filename -TargetFilename $TargetFilename -Exact }
+        }
+        $namedMatches = @($candidates | Where-Object { $_.FilenameMatch })
+        if ($namedMatches.Count -gt 0) { $candidates = $namedMatches }
+        elseif (@($candidates | Where-Object { $_.Filename }).Count -gt 0) { return $null }
+    }
+    if ($Algorithm) {
+        $canonical = ConvertTo-CanonicalChecksumAlgorithm -Algorithm $Algorithm
+        $candidates = @($candidates | Where-Object { $_.Algorithm -eq $canonical })
+    }
     if ($candidates.Count -eq 0) { return $null }
+    foreach ($candidate in $candidates) {
+        if ($candidate.Checksum.Length -ne (Get-ChecksumDigestLength -Algorithm $candidate.Algorithm)) {
+            throw "Algorithm label and digest length disagree on line $($candidate.LineNumber)."
+        }
+    }
+    foreach ($group in ($candidates | Group-Object Algorithm)) {
+        if (@($group.Group.Checksum | Select-Object -Unique).Count -gt 1) {
+            throw "Conflicting $($group.Name) checksums. Select an unambiguous checksum source."
+        }
+    }
 
     # Scoring: highest weight to FilenameMatch + Preferred label, then explicit Preferred, then algorithm known, then length, then earliest line number.
     $scored = $candidates | ForEach-Object {
@@ -1311,7 +1560,7 @@ function Test-FileChecksum {
         [string] $ExpectedChecksumOrFile,
         
         [Parameter(Mandatory=$false)]
-        [ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512')]
+        [ValidateSet('MD5','SHA1','SHA256','SHA384','SHA512','SHA3-256','SHA3-512','CRC32','BLAKE3')]
         [string] $Algorithm,
         
         [Parameter(Mandatory=$false)]
@@ -1320,6 +1569,8 @@ function Test-FileChecksum {
         [Parameter(Mandatory=$false)]
         [switch] $ShowProgress,
         
+        [switch] $ShowStatus,
+
         [Parameter(Mandatory=$false)]
         [switch] $SaveOnMismatch,
         
@@ -1328,19 +1579,20 @@ function Test-FileChecksum {
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Throw "Target file not found: $Path" }
+    $Path = (Get-Item -LiteralPath $Path -ErrorAction Stop).FullName
 
     $expectedChecksum = $null
     $derivedAlgorithm = $null
     $expectedSource = "Pasted input"
 
     # If the provided ExpectedChecksumOrFile is a path to a file, attempt to parse it; otherwise treat as literal/pasted
-    if (Test-Path -LiteralPath $ExpectedChecksumOrFile -PathType Leaf) {
+    if (Test-Path -LiteralPath $ExpectedChecksumOrFile -PathType Leaf -ErrorAction SilentlyContinue) {
         Write-LogMessage -Message ("Parsing checksum from file: {0}" -f $ExpectedChecksumOrFile) -Level INFO
         try {
-            $parsed = Get-ChecksumFromFile -Path $ExpectedChecksumOrFile -TargetFilename (Split-Path -Leaf $Path)
+            $parsed = Get-ChecksumFromFile -Path $ExpectedChecksumOrFile -TargetFilename (Split-Path -Leaf $Path) -Algorithm $Algorithm
         } catch {
             Write-LogMessage -Message ("Checksum file parse failed: {0}" -f $_.Exception.Message) -Level WARN
-            Throw "Could not parse checksum file: $ExpectedChecksumOrFile"
+            Throw "Could not parse checksum file: $($_.Exception.Message)"
         }
 
         if (-not $parsed) {
@@ -1358,18 +1610,20 @@ function Test-FileChecksum {
         }
     } else {
         # Pasted value or user-typed value: normalize and treat as checksum
-        $norm = ConvertTo-NormalizedChecksum -Raw $ExpectedChecksumOrFile -Algorithm $Algorithm
+        $parsedInput = ConvertFrom-ChecksumText -Text $ExpectedChecksumOrFile -TargetFilename (Split-Path -Leaf $Path) -Algorithm $Algorithm
+        $norm = if ($parsedInput) { $derivedAlgorithm = $parsedInput.Algorithm; $parsedInput.Checksum } else { $null }
+        if (-not $norm -and $ExpectedChecksumOrFile.Trim() -match '^[0-9A-Fa-f\s:-]+$') { $norm = ConvertTo-NormalizedChecksum -Raw $ExpectedChecksumOrFile -Algorithm $Algorithm }
         if (-not $norm) {
             Write-LogMessage -Message ("Invalid checksum format provided: {0}" -f $ExpectedChecksumOrFile.Substring(0, [Math]::Min(50, $ExpectedChecksumOrFile.Length))) -Level ERROR
-            Throw "Provided checksum string does not contain a valid hexadecimal checksum. Expected format: 32 (MD5), 40 (SHA1), 64 (SHA256), 96 (SHA384), or 128 (SHA512) hex characters."
+            Throw 'No matching checksum was found. Supply a digest, a labeled checksum, or a manifest entry matching the selected file. BLAKE3 and SHA3 need a label, filename hint, or an explicit algorithm.'
         }
         $expectedChecksum = $norm
     }
 
     # Determine algorithm to use (precedence):
     #   1) explicit -Algorithm parameter
-    #   2) length-based detection from expected checksum (works for pasted and parsed checksums)
-    #   3) algorithm hint parsed from checksum file (derivedAlgorithm)
+    #   2) explicit algorithm label parsed from the source
+    #   3) length-based detection for unlabeled digests (legacy MD5/SHA families)
     #   4) if AutoDetectAlgorithm requested but detection fails -> error
     #   5) otherwise require -Algorithm
     $chosenAlgorithm = $null
@@ -1377,7 +1631,8 @@ function Test-FileChecksum {
     if ($Algorithm) {
         $chosenAlgorithm = $Algorithm
     } else {
-        if ($expectedChecksum) {
+        if ($derivedAlgorithm) { $chosenAlgorithm = $derivedAlgorithm }
+        if (-not $chosenAlgorithm -and $expectedChecksum) {
             $lenAlg = Get-ChecksumAlgorithmFromLength -Checksum $expectedChecksum
             if ($lenAlg) { $chosenAlgorithm = $lenAlg }
         }
@@ -1405,6 +1660,7 @@ function Test-FileChecksum {
     }
 
     # Compute checksum of target file
+    if ($ShowStatus) { Write-Host ("  Algorithm: {0}" -f $chosenAlgorithm) -ForegroundColor DarkGray }
     try {
         $calc = Get-FileChecksumEx -Path $Path -Algorithm $chosenAlgorithm -ShowProgress:$ShowProgress
         
@@ -1440,14 +1696,16 @@ function Test-FileChecksum {
             $dir = Split-Path -Parent $Path
             $base = [IO.Path]::GetFileName($Path)
             $suffix = if ($Global:Settings.IncludeUsernameInMetadata) { ".$($env:USERNAME)" } else { "" }
-            $OutputPath = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.txt" -f $base, $chosenAlgorithm, $suffix)
+            $OutputPath = Join-Path -Path $dir -ChildPath ("{0}.{1}{2}.calculated.txt" -f $base, $chosenAlgorithm, $suffix)
         }
         try {
-            [System.IO.File]::WriteAllText($OutputPath, $calculatedChecksum, [System.Text.Encoding]::UTF8)
+            if ([IO.Path]::GetFullPath($OutputPath) -eq [IO.Path]::GetFullPath($Path)) { throw 'Cannot overwrite the target file.' }
+            Write-ChecksumFile -Path $OutputPath -Content $calculatedChecksum
             $result | Add-Member -NotePropertyName SavedChecksumPath -NotePropertyValue $OutputPath -Force
             Write-LogMessage -Message ("Saved checksum to {0} due to mismatch" -f $OutputPath) -Level INFO
         } catch {
             Write-LogMessage -Message ("Failed to save checksum on mismatch: {0}" -f $_.Exception.Message) -Level WARN
+            throw
         }
     }
 
@@ -1455,12 +1713,22 @@ function Test-FileChecksum {
     return $result
 }
 
+function Write-ChecksumFile {
+    param([Parameter(Mandatory=$true)][string] $Path, [Parameter(Mandatory=$true)][string] $Content)
+    $Path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    try {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Content)
+        $stream.Write($bytes, 0, $bytes.Length)
+    } finally { $stream.Dispose() }
+}
+
 function Save-ChecksumQuick { param([string] $TargetPath,[string] $Checksum)
-    try { [System.IO.File]::WriteAllText($TargetPath,$Checksum,[System.Text.Encoding]::UTF8); return $true } catch { Write-LogMessage -Message ("Quick save failed for {0}: {1}" -f $TargetPath,$_.Exception.Message) -Level WARN; return $false }
+    try { Write-ChecksumFile -Path $TargetPath -Content $Checksum; return $true } catch { Write-LogMessage -Message ("Quick save failed for {0}: {1}" -f $TargetPath,$_.Exception.Message) -Level WARN; return $false }
 }
 
 function Save-ChecksumWithMetadata { param([string] $TargetPath,[string] $Checksum,[string] $Algorithm,[string] $FilePath)
-    $now = (Get-Date).ToString("u")
+    $now = (Get-Date).ToUniversalTime().ToString("u")
     $user = if ($Global:Settings.IncludeUsernameInMetadata) { $env:USERNAME } else { "[Not recorded - Privacy setting]" }
     $displayPath = if ($Global:Settings.IncludeUsernameInMetadata) { 
         $FilePath 
@@ -1476,7 +1744,164 @@ Checksum:  $Checksum
 CreatedBy: $user
 CreatedOn: $now
 "@
-    try { [System.IO.File]::WriteAllText($TargetPath,$content,[System.Text.Encoding]::UTF8); return $true } catch { Write-LogMessage -Message ("Metadata save failed for {0}: {1}" -f $TargetPath,$_.Exception.Message) -Level WARN; return $false }
+    try { Write-ChecksumFile -Path $TargetPath -Content $content; return $true } catch { Write-LogMessage -Message ("Metadata save failed for {0}: {1}" -f $TargetPath,$_.Exception.Message) -Level WARN; return $false }
+}
+
+function Test-FileChecksums {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string[]] $Path,
+          [Parameter(Mandatory=$true)][string] $ChecksumFile,
+          [string] $Algorithm, [switch] $ShowProgress, [switch] $ShowStatus)
+    $index = 0
+    foreach ($file in $Path) {
+        $index++
+        if ($ShowStatus) {
+            Write-Host ''
+            Write-Host ("[{0}/{1}] Verifying {2}" -f $index, $Path.Count, (Split-Path -Leaf $file)) -ForegroundColor Cyan
+            Write-Host ("  Path:      {0}" -f $file) -ForegroundColor DarkGray
+            try { Write-Host ("  Size:      {0}" -f (Format-FileSize (Get-Item -LiteralPath $file -ErrorAction Stop).Length)) -ForegroundColor DarkGray }
+            catch { Write-Host '  Size:      Unavailable' -ForegroundColor DarkGray }
+        }
+        $parameters = @{ Path = $file; ExpectedChecksumOrFile = $ChecksumFile; ShowProgress = $ShowProgress; ShowStatus = $ShowStatus }
+        if ($Algorithm) { $parameters.Algorithm = $Algorithm }
+        try { $result = Test-FileChecksum @parameters }
+        catch { $result = [PSCustomObject]@{ Path = $file; Match = $false; Error = $_.Exception.Message } }
+        if ($ShowStatus) {
+            if ($result.Error) { Write-Host ("  ERROR: {0}" -f $result.Error) -ForegroundColor Red }
+            else {
+                $status = if ($result.Match) { 'OK' } else { 'MISMATCH' }
+                $color = if ($result.Match) { 'Green' } else { 'Red' }
+                Write-Host ("  {0}  {1} | {2:N2} seconds" -f $status, $result.Algorithm, $result.Elapsed.TotalSeconds) -ForegroundColor $color
+                if (-not $result.Match) {
+                    Write-Host ("  Expected:  {0}" -f $result.ExpectedChecksum) -ForegroundColor Yellow
+                    Write-Host ("  Calculated: {0}" -f $result.Calculated) -ForegroundColor Yellow
+                }
+            }
+        }
+        $result
+    }
+}
+
+function Export-ChecksumManifest {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][array] $Results,
+          [Parameter(Mandatory=$true)][string] $OutputPath,
+          [ValidateSet('Auto','GNU','SFV','Tagged')][string] $Format = 'Auto')
+    if (@($Results.Algorithm | Select-Object -Unique).Count -ne 1) { throw 'GNU manifests require one algorithm per manifest.' }
+    $algorithm = $Results[0].Algorithm
+    if ($Format -eq 'Auto') {
+        $Format = if ($algorithm -eq 'CRC32') { 'SFV' } elseif ($algorithm -eq 'BLAKE3' -or $algorithm -like 'SHA3-*') { 'Tagged' } else { 'GNU' }
+    }
+    if ($Format -eq 'SFV' -and $algorithm -ne 'CRC32') { throw 'SFV requires CRC32 results.' }
+    if ($Format -eq 'GNU' -and ($algorithm -eq 'CRC32' -or $algorithm -eq 'BLAKE3' -or $algorithm -like 'SHA3-*')) { throw 'Use Auto, SFV, or Tagged to preserve this algorithm.' }
+    $names = @($Results | ForEach-Object { [IO.Path]::GetFileName($_.Path) })
+    if (@($names | Select-Object -Unique).Count -ne $names.Count) { throw 'Duplicate filenames cannot be exported into one basename manifest.' }
+    $lines = foreach ($result in $Results) {
+        if ($result.Checksum.Length -ne (Get-ChecksumDigestLength -Algorithm $result.Algorithm) -or -not (Test-ChecksumValue $result.Checksum)) { throw 'Invalid checksum result.' }
+        $name = [IO.Path]::GetFileName($result.Path)
+        if (-not $name) { throw 'A filename is required for each result.' }
+        if ($Format -ne 'GNU' -and $name -match '[\r\n]') { throw 'SFV and tagged filenames cannot contain newlines.' }
+        if ($Format -eq 'SFV') {
+            if ($name -match '^[;#]' -or $name -ne $name.Trim()) { throw 'This filename cannot be represented safely in SFV. Use Tagged instead.' }
+            '{0} {1}' -f $name, $result.Checksum.ToUpperInvariant(); continue
+        }
+        if ($Format -eq 'Tagged') { '{0} ({1}) = {2}' -f $algorithm, $name, $result.Checksum; continue }
+        $escaped = $name.Contains('\') -or $name.Contains("`n") -or $name.Contains("`r")
+        $name = $name.Replace('\', '\\').Replace("`n", '\n').Replace("`r", '\r')
+        $prefix = if ($escaped) { '\' } else { '' }
+        '{0}{1} *{2}' -f $prefix, $result.Checksum, $name
+    }
+    Write-ChecksumFile -Path $OutputPath -Content (($lines -join "`n") + "`n")
+}
+
+function ConvertTo-ChecksumReleaseInfo {
+    param([Parameter(Mandatory=$true)] $Release)
+    if ($Release.draft -or $Release.prerelease -or $Release.tag_name -cnotmatch '^[Vv]?\d+\.\d+\.\d+$') { throw 'The release is not a supported stable version.' }
+    $version = [version]($Release.tag_name -replace '^[Vv]', '')
+    $assets = @($Release.assets | Where-Object { $_.name -ceq 'Checksum-Verify.ps1' -and $_.state -eq 'uploaded' })
+    if ($assets.Count -ne 1) { throw 'The release must contain exactly one Checksum-Verify.ps1 asset.' }
+    $asset = $assets[0]
+    if ($asset.digest -notmatch '^sha256:[a-fA-F0-9]{64}$') { throw 'The release has no SHA256 asset digest. Download manually from https://github.com/Dantdmnl/Checksum-Verify/releases.' }
+    if ([long]$asset.size -le 0 -or [long]$asset.size -gt 5MB) { throw 'Unexpected release asset size.' }
+    $url = "https://github.com/Dantdmnl/Checksum-Verify/releases/download/$($Release.tag_name)/Checksum-Verify.ps1"
+    if ($asset.browser_download_url -cne $url) { throw 'Unexpected release download URL.' }
+    [PSCustomObject]@{
+        Version = $version.ToString(); Tag = [string]$Release.tag_name
+        DownloadUrl = $url; Digest = [string]$asset.digest; Size = [long]$asset.size
+        ReleaseUrl = "https://github.com/Dantdmnl/Checksum-Verify/releases/tag/$($Release.tag_name)"
+    }
+}
+
+function Get-ChecksumRelease {
+    $previousProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Dantdmnl/Checksum-Verify/releases/latest' `
+            -Headers @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'Checksum-Verify-Updater' } -TimeoutSec 20 -ErrorAction Stop
+        ConvertTo-ChecksumReleaseInfo $release
+    } finally { [Net.ServicePointManager]::SecurityProtocol = $previousProtocol }
+}
+
+function Get-ChecksumScriptVersion {
+    param([Parameter(Mandatory=$true)][string] $Path)
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$errors)
+    if ($errors.Count -gt 0) { throw 'The downloaded script failed parser validation.' }
+    $assignments = @($ast.EndBlock.Statements | Where-Object {
+        $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $_.Left -is [Management.Automation.Language.VariableExpressionAst] -and $_.Left.VariablePath.UserPath -eq 'ScriptVersion'
+    })
+    if ($assignments.Count -ne 1) { throw 'The script must have a unique version assignment.' }
+    $expression = $assignments[0].Right.Expression
+    if ($expression -isnot [Management.Automation.Language.StringConstantExpressionAst] -or $expression.Value -notmatch '^\d+\.\d+\.\d+$') { throw 'The script version must be a literal semantic version.' }
+    $functions = @($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] } | ForEach-Object Name)
+    foreach ($required in @('Get-FileChecksumEx','Test-FileChecksum','Show-MainMenuAndReadKey')) {
+        if ($required -notin $functions) { throw 'The download is not a complete Checksum-Verify script.' }
+    }
+    return [version]$expression.Value
+}
+
+function Install-ChecksumUpdate {
+    param([Parameter(Mandatory=$true)] $Release, [Parameter(Mandatory=$true)][string] $CurrentScriptPath)
+    $checked = ConvertTo-ChecksumReleaseInfo ([PSCustomObject]@{
+        tag_name = $Release.Tag; draft = $false; prerelease = $false
+        assets = @([PSCustomObject]@{ name = 'Checksum-Verify.ps1'; state = 'uploaded'; digest = $Release.Digest; size = $Release.Size; browser_download_url = $Release.DownloadUrl })
+    })
+    $current = Get-Item -LiteralPath $CurrentScriptPath -ErrorAction Stop
+    if ($current.PSIsContainer -or $current.Extension -ne '.ps1') { throw 'The current script must be a .ps1 file.' }
+    if ([version]$checked.Version -le (Get-ChecksumScriptVersion $current.FullName)) { throw 'This version is already installed or the local script is newer.' }
+    $originalHash = (Get-FileHash -LiteralPath $current.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+    $id = [guid]::NewGuid().ToString('N')
+    $stagedPath = Join-Path $current.DirectoryName ('.Checksum-Verify.' + $id + '.update.ps1')
+    $backupPath = $current.FullName + '.' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.' + $id + '.bak'
+    $previousProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $checked.DownloadUrl -UseBasicParsing -TimeoutSec 60 -OutFile $stagedPath -ErrorAction Stop | Out-Null
+        if ((Get-Item -LiteralPath $stagedPath).Length -ne $checked.Size) { throw 'Downloaded size does not match the release asset.' }
+        if ('sha256:' + (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash -ine $checked.Digest) { throw 'Downloaded SHA256 does not match the release asset.' }
+        if ((Get-ChecksumScriptVersion $stagedPath) -ne [version]$checked.Version) { throw 'Script version does not match the release tag.' }
+        if ((Get-FileHash -LiteralPath $current.FullName -Algorithm SHA256).Hash -ne $originalHash) { throw 'The local script changed during the download. Update cancelled.' }
+        [IO.File]::Replace($stagedPath, $current.FullName, $backupPath)
+        [PSCustomObject]@{ Version = $checked.Version; BackupPath = $backupPath }
+    } finally {
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol
+        if ([IO.File]::Exists($stagedPath)) { [IO.File]::Delete($stagedPath) }
+    }
+}
+
+function Update-ChecksumTool {
+    try {
+        Write-StatusMessage 'Checking GitHub for a stable release...'
+        $release = Get-ChecksumRelease
+        if ([version]$release.Version -le [version]$ScriptVersion) { Write-Host "Already current: $ScriptVersion (latest: $($release.Version))." -ForegroundColor Green; return }
+        Write-Host "Available: $($release.Version) | Running: $ScriptVersion"
+        Write-Host "Release notes: $($release.ReleaseUrl)"
+        Write-Host 'Installation replaces this script, including local edits, and keeps a backup. Restart afterward.' -ForegroundColor Yellow
+        if ((Read-Host 'Install update? [y/N]').Trim() -ine 'y') { return }
+        $installed = Install-ChecksumUpdate -Release $release -CurrentScriptPath $script:ApplicationPath
+        Write-Host "Installed $($installed.Version). Restart to use it. Backup: $($installed.BackupPath)" -ForegroundColor Green
+    } catch { Write-Host "Update failed: $($_.Exception.Message)" -ForegroundColor Yellow }
 }
 #endregion
 
@@ -1484,14 +1909,14 @@ CreatedOn: $now
 function Show-RecentLogEntries {
     param([int] $Count = 50)
     
-    if (-not (Test-Path -Path $Global:LogFile)) {
+    if (-not (Test-Path -LiteralPath $Global:LogFile)) {
         Write-Host "No log file found." -ForegroundColor Yellow
         Start-Sleep -Milliseconds 1000
         return
     }
     
     try {
-        $lines = Get-Content -Path $Global:LogFile -Tail $Count -ErrorAction Stop
+        $lines = Get-Content -LiteralPath $Global:LogFile -Tail $Count -ErrorAction Stop
         
         Clear-Host
         Write-Host ("Recent Log Entries (last {0} lines)" -f $Count) -ForegroundColor Cyan
@@ -1555,6 +1980,7 @@ function Get-ExpectedChecksumInteractive {
         Write-MenuItem -Key "0" -Label "Back"
         Write-Host ""
         $autoChoice = Read-Host "Choose source [1]"
+        $autoChoice = $autoChoice.Trim()
         
         if ([string]::IsNullOrWhiteSpace($autoChoice)) {
             $inputValue = $discoveredFiles[0].Path
@@ -1562,8 +1988,9 @@ function Get-ExpectedChecksumInteractive {
         } elseif ($autoChoice -eq '0') {
             return $null
         } elseif ($autoChoice -match '^[0-9]+$') {
-            $idx = [int]$autoChoice - 1
-            if ($idx -ge 0 -and $idx -lt $discoveredFiles.Count) {
+            $selection = 0
+            if ([int]::TryParse($autoChoice, [ref]$selection) -and $selection -ge 1 -and $selection -le $discoveredFiles.Count) {
+                $idx = $selection - 1
                 $inputValue = $discoveredFiles[$idx].Path
                 Write-Host ("Using: {0}" -f $discoveredFiles[$idx].Name) -ForegroundColor Green
             } else {
@@ -1602,7 +2029,7 @@ function Get-ExpectedChecksumInteractive {
         Write-Host ""
         $choice = Read-Host "Choose source [P]"
         if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'P' }
-        $choice = $choice.Substring(0,1).ToUpper()
+        $choice = $choice.Trim()
 
         if ($choice -eq '0') {
             return $null
@@ -1614,8 +2041,10 @@ function Get-ExpectedChecksumInteractive {
             $chkFile = Select-File -Prompt "Select checksum file to parse"
             if (-not $chkFile) { Write-Host "No checksum file selected." -ForegroundColor Yellow; return $null }
             $inputValue = $chkFile
-        } else {
+        } elseif ($choice -eq 'P') {
             $inputValue = Read-Host "Enter expected checksum (paste) or a checksum file path"
+        } else {
+            $inputValue = $choice
             if (-not $inputValue) { Write-Host "No checksum entered." -ForegroundColor Yellow; return $null }
         }
     } else {
@@ -1754,13 +2183,22 @@ function Invoke-ChecksumResultAction {
     Write-MenuItem -Key "C" -Label "Copy to clipboard"
     Write-MenuItem -Key "F" -Label "Quick-save checksum file"
     Write-MenuItem -Key "M" -Label "Save with metadata"
+    Write-MenuItem -Key "E" -Label "Export manifest" -Detail "SFV, GNU, or labeled format"
     Write-MenuItem -Key "N" -Label "Done"
     Write-Host ""
 
-    $action = Read-MenuChoice -Prompt "Choose action (C/F/M/N)" -Default $Default
+    $action = Read-MenuChoice -Prompt "Choose action (C/F/M/E/N)" -Default $Default
     if (-not $action) { return }
 
     switch ($action.ToUpper()) {
+        'E' {
+            foreach ($result in $Results) {
+                $extension = if ($result.Algorithm -eq 'CRC32') { '.sfv' } else { ".$($result.Algorithm).sums.txt" }
+                $output = $FilePath + $extension
+                try { Export-ChecksumManifest -Results @($result) -OutputPath $output; Write-Host "Saved: $output" -ForegroundColor Green }
+                catch { Write-Host "Save failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+            }
+        }
         'C' {
             if ($Results.Count -gt 1) {
                 $copyText = ($Results | ForEach-Object { "$($_.Algorithm): $($_.Checksum)" }) -join "`r`n"
@@ -1818,9 +2256,13 @@ function Show-MainMenuAndReadKey {
     $promptSuffix = if ($Host.Name -eq 'ConsoleHost') { 'no Enter required' } else { 'press number then Enter' }
 
     Write-MenuHeader -Title ("Checksum Tool v{0}" -f $ScriptVersion) -Subtitle ("User: {0} | AutoCopy: {1} | File mode: {2}" -f $userDisplay, $autoCopyStatus, $fileMode)
-    Write-MenuItem -Key "1" -Label "Calculate checksum" -Detail "Generate one or all supported hashes"
+    Write-Host '  CHECKSUMS' -ForegroundColor Cyan
+    Write-MenuItem -Key "1" -Label "Calculate checksum" -Detail "Generate one or all available hashes"
     Write-MenuItem -Key "2" -Label "Verify checksum" -Detail "Auto-detect algorithm from pasted value or file"
-    Write-MenuItem -Key "3" -Label "Verify with chosen algorithm" -Detail "Force MD5/SHA family selection"
+    Write-MenuItem -Key "3" -Label "Verify with chosen algorithm" -Detail "Choose CRC32, SHA, or BLAKE3"
+    Write-MenuItem -Key 'B' -Label 'Batch verify' -Detail 'Check several files against one manifest'
+    Write-Host ''
+    Write-Host '  TOOLS & SETTINGS' -ForegroundColor Cyan
     if ($recentStatus.Enabled -and $recentStatus.Count -gt 0) {
         Write-MenuItem -Key "4" -Label "Recent files" -Detail $recentStatus.Detail
     } else {
@@ -1828,11 +2270,13 @@ function Show-MainMenuAndReadKey {
     }
     Write-MenuItem -Key "5" -Label "Preferences"
     Write-MenuItem -Key "6" -Label "Privacy & data"
+    Write-MenuItem -Key 'U' -Label 'Check for updates'
+    Write-MenuItem -Key 'H' -Label 'Help & algorithms'
     Write-MenuItem -Key "7" -Label "Exit"
     Write-Host ""
-    Write-Host ("Press the number key for your choice ({0})." -f $promptSuffix)
+    Write-Host ("Choose a number or letter ({0})." -f $promptSuffix)
     $key = Read-SingleKey
-    try { $key = [string]$key; $key = $key.Trim() } catch {}
+    try { $key = [string]$key; $key = $key.Trim().ToUpperInvariant() } catch {}
     return $key
 }
 
@@ -1868,13 +2312,125 @@ function Show-PrivacyMenu {
     Write-Host ""
     return (Read-MenuChoice -Prompt "Choose option (0-8)")
 }
+
+function Export-ChecksumData {
+    param([string] $OutputPath)
+    if (-not $OutputPath) {
+        $OutputPath = Join-Path ([Environment]::GetFolderPath('Desktop')) ("ChecksumTool_DataExport_{0}_{1}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'), [Guid]::NewGuid().ToString('N').Substring(0,8))
+    }
+    $data = @{ ExportDate=(Get-Date).ToUniversalTime().ToString('o'); Settings=$Global:Settings; LogFile=$Global:LogFile; ScriptVersion=$ScriptVersion }
+    Write-ChecksumFile -Path $OutputPath -Content ($data | ConvertTo-Json -Depth 10)
+    return $OutputPath
+}
+
+function Show-ChecksumHelp {
+    Clear-Host
+    Write-MenuHeader -Title 'Help & Algorithms'
+    $available = @(Get-SupportedChecksumAlgorithms)
+    Write-Host '  ALGORITHMS' -ForegroundColor Cyan
+    foreach ($algorithm in @('SHA256', 'SHA384', 'SHA512', 'MD5', 'SHA1', 'CRC32', 'SHA3-256', 'SHA3-512', 'BLAKE3')) {
+        $detail = switch ($algorithm) {
+            'SHA256' { 'Default' }
+            'MD5' { 'Legacy' }
+            'SHA1' { 'Legacy' }
+            'CRC32' { 'SFV / accidental corruption' }
+            default { 'Available' }
+        }
+        $color = 'White'
+        if ($algorithm -notin $available) {
+            $detail = if ($algorithm -eq 'BLAKE3') { 'Needs b3sum.exe (install below)' } else { 'Unavailable in this runtime' }
+            $color = 'DarkGray'
+        }
+        Write-Host ('  {0,-12} {1}' -f $algorithm, $detail) -ForegroundColor $color
+    }
+    Write-Host ''
+    Write-Host '  CHECKSUM FILES' -ForegroundColor Cyan
+    Write-Host '  SFV          Filename, then CRC32 hash'
+    Write-Host '  GNU          Hash, then filename'
+    Write-Host '  Tagged       Algorithm, filename, and hash'
+    Write-Host '  For SHA3/BLAKE3, keep the algorithm label or select it explicitly.' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '  SAVES & UPDATES' -ForegroundColor Cyan
+    Write-Host '  Saves        Existing files are protected; move them to save again.'
+    Write-Host '  Updates      Choose U in the main menu to check GitHub.'
+    Write-Host '               Downloads are verified; installation keeps a backup.' -ForegroundColor DarkGray
+    if ('BLAKE3' -notin $available) {
+        Write-Host ''
+        Write-Host '  BLAKE3 SETUP' -ForegroundColor Cyan
+        Write-Host '  Install the official Windows x64 tool, or put b3sum.exe'
+        Write-Host '  beside this script or on PATH.'
+        Write-Host '  https://github.com/BLAKE3-team/BLAKE3/releases' -ForegroundColor DarkGray
+        Write-Host ''
+        Write-MenuItem -Key 'I' -Label 'Install BLAKE3 support'
+        Write-MenuItem -Key '0' -Label 'Back'
+        if ((Read-MenuChoice -Prompt 'Choose (I/0)' -Default '0') -eq 'I') {
+            Write-Host 'This downloads b3sum.exe from the official BLAKE3 GitHub release and stores it beside this script.' -ForegroundColor Yellow
+            if ((Read-Host 'Download and install b3sum.exe? [y/N]').Trim() -ieq 'y') {
+                try {
+                    $installed = Install-Blake3Tool -Directory (Split-Path -Parent $script:ApplicationPath)
+                    Write-Host "Installed $($installed.Version): $($installed.Path)" -ForegroundColor Green
+                } catch { Write-Host "BLAKE3 setup failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+            }
+        }
+    }
+}
+
+function Invoke-BatchChecksumVerification {
+    $manifest = Select-File -Prompt 'Choose checksum manifest (SFV, GNU, or labeled)'
+    if (-not $manifest) { return }
+    $paths = @()
+    if ($Global:Settings.UseFileDialog) {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $dialog = New-Object Windows.Forms.OpenFileDialog
+        try {
+            $dialog.Title = 'Select files to verify'
+            $dialog.Multiselect = $true
+            $dialog.InitialDirectory = Split-Path -Parent $manifest
+            if ($dialog.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return }
+            $paths = @($dialog.FileNames)
+        } finally { $dialog.Dispose() }
+    } else {
+        do {
+            $inputPath = Read-Host 'File path (Enter finishes selection)'
+            if (-not [string]::IsNullOrWhiteSpace($inputPath)) {
+                $inputPath = $inputPath.Trim().Trim('"', "'")
+                if (Test-Path -LiteralPath $inputPath -PathType Leaf) { $paths += (Get-Item -LiteralPath $inputPath).FullName }
+                else { Write-Host 'File not found.' -ForegroundColor Yellow }
+            }
+        } while (-not [string]::IsNullOrWhiteSpace($inputPath))
+    }
+    if ($paths.Count -eq 0) { return }
+    $paths = @($paths | Select-Object -Unique)
+    Write-Host ''
+    Write-MenuHeader -Title 'Batch Verification'
+    Write-Host ("  Manifest: {0}" -f $manifest) -ForegroundColor White
+    Write-Host ("  Files:    {0}" -f $paths.Count) -ForegroundColor White
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $results = @(Test-FileChecksums -Path $paths -ChecksumFile $manifest -ShowProgress -ShowStatus)
+    $timer.Stop()
+    $passed = @($results | Where-Object Match).Count
+    $errors = @($results | Where-Object Error).Count
+    $mismatches = $results.Count - $passed - $errors
+    Write-Host ''
+    Write-Host ("{0} of {1} files verified." -f $passed, $results.Count)
+    Write-Host ("  Mismatches: {0} | Errors: {1} | Time: {2:N2} seconds" -f $mismatches, $errors, $timer.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+}
 #endregion
 
-#region Main loop (Preferences: LogDirectory is option 5, Back is 6)
+#region Main loop
+if ($NoMenu -or $MyInvocation.InvocationName -eq '.') { return }
 while ($true) {
     $k = Show-MainMenuAndReadKey
 
     switch ($k) {
+        'B' {
+            try { Invoke-BatchChecksumVerification }
+            catch { Show-FriendlyError -Action 'Batch verification' -ErrorRecord $_ }
+            Wait-ForUser
+        }
+        'U' { Update-ChecksumTool; Wait-ForUser }
+        'H' { Show-ChecksumHelp; Wait-ForUser }
+        'Q' { Save-Settings -Settings $Global:Settings | Out-Null; return }
         '1' {
             $file = Select-File -Prompt "Choose file to calculate checksum" -ShowFileInfo
             if (-not $file) { Write-Host "No file selected." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700; continue }
@@ -2015,7 +2571,7 @@ while ($true) {
             }
             
             if ($action -eq '1') {
-                $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm" -Default "SHA256"
+                $alg = Select-AlgorithmMenu -Prompt "Choose hash algorithm" -Default "SHA256" -AllowAll
                 if (-not $alg) { Write-Host "Cancelled." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 700; continue }
                 
                 Write-LogMessage -Message ("User requested checksum for recent file {0} using {1}" -f $file, $alg) -Level INFO
@@ -2032,7 +2588,8 @@ while ($true) {
                     Show-ChecksumResults -Results @($res) -FilePath $file
                     
                     if ($Global:Settings.AutoCopyToClipboard) {
-                        if (Copy-ToClipboard -Text $res.Checksum) {
+                        $copyText = if (@($res).Count -gt 1) { ($res | ForEach-Object { "$($_.Algorithm): $($_.Checksum)" }) -join "`r`n" } else { $res.Checksum }
+                        if (Copy-ToClipboard -Text $copyText) {
                             Write-Host "Checksum automatically copied to clipboard." -ForegroundColor Yellow
                         }
                     }
@@ -2133,13 +2690,13 @@ while ($true) {
                         if ($val) {
                             try {
                                 $d = [double]$val
-                                if ($d -ge 0) {
+                                if (-not [double]::IsNaN($d) -and -not [double]::IsInfinity($d) -and $d -ge 0 -and $d -le 100) {
                                     $Global:Settings.ProgressMinDeltaPercent = $d
                                     if (Save-Settings -Settings $Global:Settings) {
                                         Write-Host ("Set ProgressMinDeltaPercent to {0}" -f $Global:Settings.ProgressMinDeltaPercent) -ForegroundColor Yellow
                                         Write-LogMessage -Message ("ProgressMinDeltaPercent set to {0}" -f $d) -Level INFO
                                     } else { Write-Host "Failed to save settings." -ForegroundColor Red }
-                                } else { Write-Host "Must be >= 0. No change." -ForegroundColor Yellow }
+                                } else { Write-Host "Must be between 0 and 100. No change." -ForegroundColor Yellow }
                             } catch { Write-Host "Invalid value; no change." -ForegroundColor Yellow }
                         } else { Write-Host "No change." -ForegroundColor Yellow }
                         Start-Sleep -Milliseconds 700
@@ -2158,7 +2715,7 @@ while ($true) {
                         if ($val) {
                             try {
                                 $gb = [double]$val
-                                if ($gb -gt 0) {
+                                if (-not [double]::IsNaN($gb) -and -not [double]::IsInfinity($gb) -and $gb -gt 0) {
                                     $Global:Settings.LargeFileSizeWarningGB = $gb
                                     if (Save-Settings -Settings $Global:Settings) {
                                         Write-Host ("Large file warning threshold set to {0:N1} GB" -f $gb) -ForegroundColor Yellow
@@ -2172,24 +2729,25 @@ while ($true) {
                     '6' {
                         $new = $null
                         if ($Global:Settings.UseFileDialog) {
+                            $dlg = $null
                             try {
                                 Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
                                 $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
                                 $dlg.Description = "Select folder to store logs"
-                                if (Test-Path $Global:Settings.LogDirectory) { $dlg.SelectedPath = $Global:Settings.LogDirectory }
+                                if (Test-Path -LiteralPath $Global:Settings.LogDirectory -PathType Container) { $dlg.SelectedPath = $Global:Settings.LogDirectory }
                                 if ($dlg.ShowDialog() -eq 'OK') { $new = $dlg.SelectedPath }
                             } catch {
                                 Write-LogMessage -Message ("Folder dialog failed: {0}" -f $_.Exception.Message) -Level WARN
                                 $new = $null
-                            }
+                            } finally { if ($dlg) { $dlg.Dispose() } }
                         } else {
                             $userInput = Read-Host ("Enter log directory full path (leave blank to cancel) [Current: {0}]" -f $Global:Settings.LogDirectory)
                             if ($userInput) { $new = $userInput.Trim().Trim('"','''') } else { $new = $null }
                         }
 
                         if ($new) {
-                            try { if (-not (Test-Path -Path $new)) { New-Item -ItemType Directory -Path $new -Force | Out-Null } } catch {}
-                            if (Test-Path -Path $new) {
+                            try { [void][IO.Directory]::CreateDirectory($new) } catch {}
+                            if (Test-Path -LiteralPath $new -PathType Container) {
                                 $Global:Settings.LogDirectory = $new
                                 $Global:LogDirectory = $new
                                 $Global:LogFile = Join-Path -Path $Global:LogDirectory -ChildPath "checksum_tool.log"
@@ -2278,10 +2836,10 @@ while ($true) {
                         $confirm = Read-Host "Clear all log files? This cannot be undone. (Y/N) [N]"
                         if ($confirm -match '^[yY]') {
                             try {
-                                if (Test-Path $Global:LogFile) { Remove-Item -Path $Global:LogFile -Force }
+                                if (Test-Path -LiteralPath $Global:LogFile) { Remove-Item -LiteralPath $Global:LogFile -Force -ErrorAction Stop }
                                 for ($i = 1; $i -le $Global:MaxLogArchives; $i++) {
                                     $archiveLog = "$Global:LogFile.$i.log"
-                                    if (Test-Path $archiveLog) { Remove-Item -Path $archiveLog -Force }
+                                    if (Test-Path -LiteralPath $archiveLog) { Remove-Item -LiteralPath $archiveLog -Force -ErrorAction Stop }
                                 }
                                 Write-Host "All log files cleared." -ForegroundColor Green
                                 Write-LogMessage -Message "User cleared all log files" -Level INFO
@@ -2295,15 +2853,7 @@ while ($true) {
                     }
                     '7' {
                         try {
-                            $exportData = @{
-                                ExportDate = (Get-Date).ToString("o")
-                                Settings = $Global:Settings
-                                LogFile = $Global:LogFile
-                                ScriptVersion = $ScriptVersion
-                            }
-                            $json = $exportData | ConvertTo-Json -Depth 10
-                            $exportPath = Join-Path -Path ([Environment]::GetFolderPath('Desktop')) -ChildPath ("ChecksumTool_DataExport_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-                            [System.IO.File]::WriteAllText($exportPath, $json, [System.Text.Encoding]::UTF8)
+                            $exportPath = Export-ChecksumData
                             Write-Host ("Data exported to: {0}" -f $exportPath) -ForegroundColor Green
                             Write-LogMessage -Message "User exported all data" -Level INFO
                         } catch {
@@ -2323,19 +2873,19 @@ while ($true) {
                             try {
                                 # Delete settings
                                 $settingsPath = Get-SettingsFilePath
-                                if (Test-Path $settingsPath) { Remove-Item -Path $settingsPath -Force }
+                                if (Test-Path -LiteralPath $settingsPath) { Remove-Item -LiteralPath $settingsPath -Force -ErrorAction Stop }
                                 
                                 # Delete logs
-                                if (Test-Path $Global:LogFile) { Remove-Item -Path $Global:LogFile -Force }
+                                if (Test-Path -LiteralPath $Global:LogFile) { Remove-Item -LiteralPath $Global:LogFile -Force -ErrorAction Stop }
                                 for ($i = 1; $i -le $Global:MaxLogArchives; $i++) {
                                     $archiveLog = "$Global:LogFile.$i.log"
-                                    if (Test-Path $archiveLog) { Remove-Item -Path $archiveLog -Force }
+                                    if (Test-Path -LiteralPath $archiveLog) { Remove-Item -LiteralPath $archiveLog -Force -ErrorAction Stop }
                                 }
                                 
                                 Write-Host ""
                                 Write-Host "All data deleted. The tool will now exit." -ForegroundColor Green
                                 Start-Sleep -Seconds 2
-                                exit
+                                return
                             } catch {
                                 Write-Host "Deletion failed: $($_.Exception.Message)" -ForegroundColor Red
                                 Start-Sleep -Milliseconds 2000
@@ -2356,7 +2906,7 @@ while ($true) {
         '7' {
             if (Save-Settings -Settings $Global:Settings) { Write-LogMessage -Message "Settings saved on exit" -Level INFO }
             Write-LogMessage -Message "Checksum tool exiting" -Level INFO
-            exit
+            return
         }
 
         default { Write-Host "Invalid option" -ForegroundColor Red; Start-Sleep -Milliseconds 700 }
